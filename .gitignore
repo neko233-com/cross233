@@ -1,0 +1,4 @@
+/dist/
+/cross233-cert.pem
+/cross233-key.pem
+*.exe
