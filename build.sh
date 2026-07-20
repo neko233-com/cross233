@@ -18,3 +18,4 @@ build darwin amd64 cross233-client ./cross233-client
 build darwin arm64 cross233-client ./cross233-client
 build linux amd64 cross233-client ./cross233-client
 build linux arm64 cross233-client ./cross233-client
+(cd dist && sha256sum cross233-* > checksums.txt)

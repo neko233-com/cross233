@@ -21,3 +21,7 @@ foreach ($target in $targets) {
   $env:CGO_ENABLED = '0'; $env:GOOS = $target.OS; $env:GOARCH = $target.Arch
   go build -trimpath -ldflags='-s -w' -o $out $pkg
 }
+
+Get-ChildItem -File $dist | Sort-Object Name | ForEach-Object {
+  "{0}  {1}" -f (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant(), $_.Name
+} | Set-Content -Encoding ascii (Join-Path $dist 'checksums.txt')

@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -18,6 +19,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -55,6 +58,7 @@ type server struct {
 	pending    map[string]chan net.Conn
 	logs       []string
 	sessionKey []byte
+	startedAt  time.Time
 }
 
 func main() {
@@ -76,7 +80,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	s := &server{cfg: cfg, services: map[int]*serviceEntry{}, pending: map[string]chan net.Conn{}, sessionKey: randomBytes(32)}
+	s := &server{cfg: cfg, services: map[int]*serviceEntry{}, pending: map[string]chan net.Conn{}, sessionKey: randomBytes(32), startedAt: time.Now().UTC()}
 	tlsListener, err := tls.Listen("tcp", net.JoinHostPort(cfg.bind, fmt.Sprint(cfg.controlPort)), &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13})
 	if err != nil {
 		log.Fatal(err)
@@ -261,10 +265,90 @@ func (s *server) addLog(format string, args ...any) {
 
 func (s *server) webHandler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", s.health)
+	mux.HandleFunc("/api/v1/status", s.apiStatus)
+	mux.HandleFunc("/api/v1/services", s.apiServices)
+	mux.HandleFunc("/api/v1/logs", s.apiLogs)
 	mux.HandleFunc("/login", s.login)
 	mux.HandleFunc("/logout", s.logout)
 	mux.HandleFunc("/", s.dashboard)
 	return mux
+}
+
+func (s *server) health(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *server) apiStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAPI(w, r) {
+		return
+	}
+	s.mu.RLock()
+	serviceCount := len(s.services)
+	s.mu.RUnlock()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":         "ok",
+		"started_at":     s.startedAt,
+		"uptime_seconds": int64(time.Since(s.startedAt).Seconds()),
+		"control_port":   s.cfg.controlPort,
+		"web_port":       s.cfg.webPort,
+		"public_ports":   fmt.Sprintf("%d-%d", s.cfg.portMin, s.cfg.portMax),
+		"service_count":  serviceCount,
+	})
+}
+
+func (s *server) apiServices(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAPI(w, r) {
+		return
+	}
+	type serviceView struct {
+		Name       string `json:"name"`
+		RemotePort int    `json:"remote_port"`
+		LocalAddr  string `json:"local_addr"`
+		ClientID   string `json:"client_id"`
+	}
+	s.mu.RLock()
+	services := make([]serviceView, 0, len(s.services))
+	for _, entry := range s.services {
+		services = append(services, serviceView{Name: entry.service.Name, RemotePort: entry.service.RemotePort, LocalAddr: entry.service.LocalAddr, ClientID: entry.client.id})
+	}
+	s.mu.RUnlock()
+	sort.Slice(services, func(i, j int) bool { return services[i].RemotePort < services[j].RemotePort })
+	writeJSON(w, http.StatusOK, map[string]any{"services": services})
+}
+
+func (s *server) apiLogs(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAPI(w, r) {
+		return
+	}
+	s.mu.RLock()
+	logs := append([]string(nil), s.logs...)
+	s.mu.RUnlock()
+	writeJSON(w, http.StatusOK, map[string]any{"logs": logs})
+}
+
+func (s *server) requireAPI(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return false
+	}
+	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.password)) != 1 {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	return true
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
 }
 
 func (s *server) login(w http.ResponseWriter, r *http.Request) {
