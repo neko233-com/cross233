@@ -1,8 +1,11 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -21,7 +24,8 @@ import (
 
 type clientConfig struct {
 	Server   string             `json:"server"`
-	Password string             `json:"password"`
+	AuthKey  string             `json:"auth_key"`
+	KeyFile  string             `json:"key_file"`
 	CAFile   string             `json:"ca_file"`
 	Insecure bool               `json:"insecure"`
 	ClientID string             `json:"client_id"`
@@ -33,7 +37,8 @@ func main() {
 	var configPath, serviceSpec string
 	flag.StringVar(&configPath, "config", "", "JSON config path")
 	flag.StringVar(&cfg.Server, "server", "", "server control address, e.g. host:7710")
-	flag.StringVar(&cfg.Password, "password", "", "shared server password")
+	flag.StringVar(&cfg.AuthKey, "auth-key", "", "shared access key")
+	flag.StringVar(&cfg.KeyFile, "key-file", "", "access key file path")
 	flag.StringVar(&cfg.CAFile, "ca", "", "server certificate PEM path")
 	flag.BoolVar(&cfg.Insecure, "insecure", false, "skip TLS verification; testing only")
 	flag.StringVar(&cfg.ClientID, "client-id", "", "stable client identifier")
@@ -55,9 +60,16 @@ func main() {
 		}
 		cfg.Services = services
 	}
-	if cfg.Server == "" || cfg.Password == "" || len(cfg.Services) == 0 {
+	if cfg.KeyFile != "" {
+		data, err := os.ReadFile(cfg.KeyFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		cfg.AuthKey = strings.TrimSpace(string(data))
+	}
+	if cfg.Server == "" || cfg.AuthKey == "" || len(cfg.Services) == 0 {
 		flag.Usage()
-		log.Fatal("server, password and at least one service required")
+		log.Fatal("server, auth key and at least one service required")
 	}
 	if !cfg.Insecure && cfg.CAFile == "" {
 		log.Fatal("TLS verification requires -ca; use -insecure only for local testing")
@@ -101,10 +113,14 @@ func runClient(cfg clientConfig, tlsConfig *tls.Config) error {
 	}
 	defer conn.Close()
 	enc := json.NewEncoder(conn)
-	if err := enc.Encode(protocol.Message{Type: "client", Password: cfg.Password, ClientID: cfg.ClientID, Services: cfg.Services}); err != nil {
+	hello := protocol.Message{Type: "client", ClientID: cfg.ClientID, Services: cfg.Services}
+	if err := enc.Encode(hello); err != nil {
 		return err
 	}
 	dec := json.NewDecoder(conn)
+	if err := authenticate(dec, enc, cfg.AuthKey, hello); err != nil {
+		return err
+	}
 	var ready protocol.Message
 	if err := dec.Decode(&ready); err != nil {
 		return err
@@ -134,7 +150,13 @@ func openTunnel(cfg clientConfig, tlsConfig *tls.Config, msg protocol.Message) {
 		return
 	}
 	defer tunnel.Close()
-	if err := json.NewEncoder(tunnel).Encode(protocol.Message{Type: "tunnel", Password: cfg.Password, ID: msg.ID}); err != nil {
+	enc := json.NewEncoder(tunnel)
+	dec := json.NewDecoder(tunnel)
+	hello := protocol.Message{Type: "tunnel", ID: msg.ID}
+	if err := enc.Encode(hello); err != nil {
+		return
+	}
+	if err := authenticate(dec, enc, cfg.AuthKey, hello); err != nil {
 		return
 	}
 	local, err := net.DialTimeout("tcp", msg.Service.LocalAddr, 10*time.Second)
@@ -144,6 +166,28 @@ func openTunnel(cfg clientConfig, tlsConfig *tls.Config, msg protocol.Message) {
 	}
 	defer local.Close()
 	bridge(tunnel, local)
+}
+
+func authenticate(dec *json.Decoder, enc *json.Encoder, key string, hello protocol.Message) error {
+	var challenge protocol.Message
+	if err := dec.Decode(&challenge); err != nil {
+		return err
+	}
+	if challenge.Type == "error" {
+		return errors.New(challenge.Error)
+	}
+	if challenge.Type != "challenge" || challenge.Nonce == "" {
+		return errors.New("invalid server challenge")
+	}
+	proof := makeAuthProof(key, hello, challenge.Nonce)
+	return enc.Encode(protocol.Message{Type: "auth", Proof: base64.RawURLEncoding.EncodeToString(proof)})
+}
+
+func makeAuthProof(key string, hello protocol.Message, nonce string) []byte {
+	data := strings.Join([]string{"cross233/v1", hello.Type, hello.ClientID, hello.ID, nonce}, "\x00")
+	h := hmac.New(sha256.New, []byte(key))
+	_, _ = h.Write([]byte(data))
+	return h.Sum(nil)
 }
 
 func bridge(left, right net.Conn) {

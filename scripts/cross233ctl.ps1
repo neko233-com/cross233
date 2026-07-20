@@ -3,7 +3,7 @@ param(
     [ValidateSet('help', 'server-health', 'server-status', 'server-services', 'server-logs', 'client-validate', 'client-run', 'client-start', 'client-stop', 'client-restart', 'client-status', 'client-logs')]
     [string]$Command = 'help',
     [string]$Url = $(if ($env:CROSS233_URL) { $env:CROSS233_URL } else { 'https://127.0.0.1:7711' }),
-    [string]$Password = $env:CROSS233_PASSWORD,
+    [string]$AuthKey = $env:CROSS233_AUTH_KEY,
     [string]$CAFile = $env:CROSS233_CA_FILE,
     [switch]$Insecure = ($env:CROSS233_INSECURE -eq '1'),
     [string]$Config,
@@ -20,13 +20,13 @@ cross233ctl.ps1 commands:
   client-validate -Config FILE | client-run -Config FILE | client-start -Config FILE
   client-stop | client-restart -Config FILE | client-status | client-logs
 
-Remote API: set CROSS233_PASSWORD and optionally CROSS233_URL, CROSS233_CA_FILE, CROSS233_INSECURE=1.
+Remote API: set CROSS233_AUTH_KEY and optionally CROSS233_URL, CROSS233_CA_FILE, CROSS233_INSECURE=1.
 '@ | Write-Output
 }
 
 function Invoke-Cross233Api([string]$Path) {
-    if ([string]::IsNullOrWhiteSpace($Password)) { throw 'Set CROSS233_PASSWORD for remote API commands.' }
-    $arguments = @('-fsS', '-H', "Authorization: Bearer $Password")
+    if ([string]::IsNullOrWhiteSpace($AuthKey)) { throw 'Set CROSS233_AUTH_KEY for remote API commands.' }
+    $arguments = @('-fsS', '-H', "Authorization: Bearer $AuthKey")
     if ($CAFile) { $arguments += @('--cacert', $CAFile) }
     if ($Insecure) { $arguments += '-k' }
     $arguments += "$Url$Path"
@@ -46,7 +46,7 @@ function Require-Config {
 
 function Test-ClientConfig([string]$Path) {
     $configData = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
-    if ([string]::IsNullOrWhiteSpace($configData.server) -or [string]::IsNullOrWhiteSpace($configData.password)) { throw 'Config needs server and password.' }
+    if ([string]::IsNullOrWhiteSpace($configData.server) -or ([string]::IsNullOrWhiteSpace($configData.auth_key) -and [string]::IsNullOrWhiteSpace($configData.key_file))) { throw 'Config needs server and auth_key or key_file.' }
     if ($null -eq $configData.services -or $configData.services.Count -eq 0) { throw 'Config needs at least one service.' }
     foreach ($service in $configData.services) {
         if ([string]::IsNullOrWhiteSpace($service.name) -or $service.remote_port -lt 7712 -or $service.remote_port -gt 7720 -or [string]::IsNullOrWhiteSpace($service.local_addr)) { throw "Invalid service '$($service.name)'." }

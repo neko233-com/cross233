@@ -1,6 +1,6 @@
 {
   "server": "SERVER:7710",
-  "password": "change-this-now",
+  "key_file": "cross233-auth.key",
   "ca_file": "cross233-cert.pem",
   "client_id": "edge-client-1",
   "services": [

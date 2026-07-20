@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 SERVER_URL="${CROSS233_URL:-https://127.0.0.1:7711}"
-SERVER_PASSWORD="${CROSS233_PASSWORD:-}"
+SERVER_AUTH_KEY="${CROSS233_AUTH_KEY:-}"
 SERVER_CA_FILE="${CROSS233_CA_FILE:-}"
 SERVER_INSECURE="${CROSS233_INSECURE:-0}"
 CLIENT_BIN="${CROSS233_CLIENT_BIN:-$SCRIPT_DIR/../cross233-client}"
@@ -18,14 +18,14 @@ Server local:  server-start | server-stop | server-restart | server-enable | ser
 Server remote: server-health | server-api-status | server-api-services | server-api-logs
 Client:         client-run --config FILE | client-start --config FILE | client-stop | client-restart --config FILE | client-status | client-logs
 
-Remote API environment: CROSS233_URL, CROSS233_PASSWORD, CROSS233_CA_FILE, CROSS233_INSECURE=1.
+Remote API environment: CROSS233_URL, CROSS233_AUTH_KEY, CROSS233_CA_FILE, CROSS233_INSECURE=1.
 EOF
 }
 fail() { printf 'cross233ctl: %s\n' "$*" >&2; exit 1; }
 run_root() { if [ "$(id -u)" -eq 0 ]; then "$@"; elif command -v sudo >/dev/null 2>&1; then sudo "$@"; else fail "root or sudo required"; fi; }
 api_get() {
-  [ -n "$SERVER_PASSWORD" ] || fail "set CROSS233_PASSWORD for remote API commands"
-  local args=(-fsS -H "Authorization: Bearer $SERVER_PASSWORD")
+  [ -n "$SERVER_AUTH_KEY" ] || fail "set CROSS233_AUTH_KEY for remote API commands"
+  local args=(-fsS -H "Authorization: Bearer $SERVER_AUTH_KEY")
   [ -n "$SERVER_CA_FILE" ] && args+=(--cacert "$SERVER_CA_FILE")
   [ "$SERVER_INSECURE" = 1 ] && args+=(-k)
   curl "${args[@]}" "$SERVER_URL$1"

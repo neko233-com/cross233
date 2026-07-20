@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-const loginPage = `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>cross233</title><style>body{font:16px system-ui;background:#f4f6f8;color:#18212b;display:grid;place-items:center;height:90vh;margin:0}form{background:white;border:1px solid #d6dce2;padding:28px;width:min(340px,calc(100vw - 48px))}input,button{box-sizing:border-box;width:100%;padding:10px;font:inherit;margin-top:12px}button{background:#0d6b5d;color:#fff;border:0;cursor:pointer}</style></head><body><form method="post"><h1>cross233</h1><p>Server password</p><input type="password" name="password" autofocus required><button>Enter</button></form></body></html>`
+const loginPage = `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>cross233</title><style>body{font:16px system-ui;background:#f4f6f8;color:#18212b;display:grid;place-items:center;height:90vh;margin:0}form{background:white;border:1px solid #d6dce2;padding:28px;width:min(340px,calc(100vw - 48px))}input,button{box-sizing:border-box;width:100%;padding:10px;font:inherit;margin-top:12px}button{background:#0d6b5d;color:#fff;border:0;cursor:pointer}</style></head><body><form method="post"><h1>cross233</h1><p>Access key</p><input type="password" name="auth_key" autofocus required><button>Enter</button></form></body></html>`
 
 func dashboardPage(services []*serviceEntry, logs []string) string {
 	var rows, events strings.Builder

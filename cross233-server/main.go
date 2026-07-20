@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -28,8 +29,8 @@ import (
 )
 
 type config struct {
-	bind, password, certFile, keyFile      string
-	controlPort, webPort, portMin, portMax int
+	bind, authKey, authKeyFile, certFile, keyFile string
+	controlPort, webPort, portMin, portMax        int
 }
 
 type clientConn struct {
@@ -64,7 +65,8 @@ type server struct {
 func main() {
 	cfg := config{}
 	flag.StringVar(&cfg.bind, "bind", "0.0.0.0", "listen address")
-	flag.StringVar(&cfg.password, "password", "root", "shared server and web password")
+	flag.StringVar(&cfg.authKey, "auth-key", "", "shared access key; empty uses or creates auth-key-file")
+	flag.StringVar(&cfg.authKeyFile, "auth-key-file", "cross233-auth.key", "access key file path")
 	flag.StringVar(&cfg.certFile, "cert", "cross233-cert.pem", "TLS certificate path")
 	flag.StringVar(&cfg.keyFile, "key", "cross233-key.pem", "TLS key path")
 	flag.IntVar(&cfg.controlPort, "control-port", 7710, "TLS control port")
@@ -72,9 +74,14 @@ func main() {
 	flag.IntVar(&cfg.portMin, "port-min", 7712, "first public TCP port")
 	flag.IntVar(&cfg.portMax, "port-max", 7720, "last public TCP port")
 	flag.Parse()
-	if cfg.password == "" || cfg.portMin > cfg.portMax {
-		log.Fatal("password required and port range must be valid")
+	if cfg.portMin > cfg.portMax {
+		log.Fatal("port range must be valid")
 	}
+	key, err := loadOrCreateAuthKey(cfg.authKey, cfg.authKeyFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	cfg.authKey = key
 
 	cert, err := loadOrCreateCert(cfg.certFile, cfg.keyFile)
 	if err != nil {
@@ -112,8 +119,20 @@ func (s *server) handleControl(conn net.Conn) {
 		conn.Close()
 		return
 	}
-	if hello.Password != s.cfg.password {
-		json.NewEncoder(conn).Encode(protocol.Message{Type: "error", Error: "invalid password"})
+	if hello.Type != "client" && hello.Type != "tunnel" {
+		json.NewEncoder(conn).Encode(protocol.Message{Type: "error", Error: "invalid connection type"})
+		conn.Close()
+		return
+	}
+	nonce := base64.RawURLEncoding.EncodeToString(randomBytes(32))
+	enc := json.NewEncoder(conn)
+	if err := enc.Encode(protocol.Message{Type: "challenge", Nonce: nonce}); err != nil {
+		conn.Close()
+		return
+	}
+	var auth protocol.Message
+	if err := dec.Decode(&auth); err != nil || auth.Type != "auth" || !verifyProof(s.cfg.authKey, hello, nonce, auth.Proof) {
+		enc.Encode(protocol.Message{Type: "error", Error: "invalid access key"})
 		conn.Close()
 		return
 	}
@@ -125,9 +144,6 @@ func (s *server) handleControl(conn net.Conn) {
 		if !s.handleTunnel(conn, hello) {
 			conn.Close()
 		}
-	default:
-		json.NewEncoder(conn).Encode(protocol.Message{Type: "error", Error: "invalid connection type"})
-		conn.Close()
 	}
 }
 
@@ -337,7 +353,7 @@ func (s *server) requireAPI(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.password)) != 1 {
+	if subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.authKey)) != 1 {
 		w.Header().Set("WWW-Authenticate", "Bearer")
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return false
@@ -356,8 +372,8 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, loginPage)
 		return
 	}
-	if r.Method != http.MethodPost || r.FormValue("password") != s.cfg.password {
-		http.Error(w, "wrong password", http.StatusUnauthorized)
+	if r.Method != http.MethodPost || subtle.ConstantTimeCompare([]byte(r.FormValue("auth_key")), []byte(s.cfg.authKey)) != 1 {
+		http.Error(w, "wrong access key", http.StatusUnauthorized)
 		return
 	}
 	http.SetCookie(w, &http.Cookie{Name: "cross233_session", Value: s.sign("ok"), HttpOnly: true, SameSite: http.SameSiteStrictMode, Path: "/", MaxAge: 86400})
@@ -418,6 +434,44 @@ func loadOrCreateCert(certFile, keyFile string) (tls.Certificate, error) {
 		return tls.Certificate{}, err
 	}
 	return tls.X509KeyPair(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyBytes}))
+}
+
+func loadOrCreateAuthKey(provided, file string) (string, error) {
+	if provided != "" {
+		if len(provided) < 32 {
+			return "", errors.New("auth key must be at least 32 characters")
+		}
+		return provided, nil
+	}
+	if data, err := os.ReadFile(file); err == nil {
+		key := strings.TrimSpace(string(data))
+		if len(key) < 32 {
+			return "", errors.New("auth key file must contain at least 32 characters")
+		}
+		return key, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil && filepath.Dir(file) != "." {
+		return "", err
+	}
+	key := base64.RawURLEncoding.EncodeToString(randomBytes(32))
+	if err := os.WriteFile(file, []byte(key+"\n"), 0600); err != nil {
+		return "", err
+	}
+	log.Printf("generated access key at %s", file)
+	return key, nil
+}
+
+func verifyProof(key string, hello protocol.Message, nonce, proof string) bool {
+	expected := authProof(key, hello, nonce)
+	actual, err := base64.RawURLEncoding.DecodeString(proof)
+	return err == nil && subtle.ConstantTimeCompare(actual, expected) == 1
+}
+
+func authProof(key string, hello protocol.Message, nonce string) []byte {
+	data := strings.Join([]string{"cross233/v1", hello.Type, hello.ClientID, hello.ID, nonce}, "\x00")
+	return hmacSHA256([]byte(key), []byte(data))
 }
 
 func randomBytes(n int) []byte {
