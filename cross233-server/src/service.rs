@@ -297,7 +297,7 @@ impl SharedServiceState {
     pub async fn get_service_by_host(&self, host: &str) -> Option<Arc<ServiceEntry>> {
         let by_name = self.services_by_name.read().await;
         let host_lower = host.to_ascii_lowercase();
-        for (_, entry) in by_name.iter() {
+        for entry in by_name.values() {
             if !entry.enabled.load(Ordering::Relaxed) {
                 continue;
             }
@@ -532,7 +532,7 @@ impl SharedServiceState {
 
     pub async fn get_service_name_by_port(&self, port: u16) -> Option<String> {
         let by_name = self.services_by_name.read().await;
-        for (_, entry) in by_name.iter() {
+        for entry in by_name.values() {
             if entry.config.remote_port == port {
                 return Some(entry.config.name.clone());
             }
