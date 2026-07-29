@@ -36,7 +36,7 @@ fn parse_sni(data: &[u8]) -> Option<String> {
     if pos + 2 > handshake.len() {
         return None;
     }
-    let ext_len = u16::from_be_bytes([handshake[pos], handshake[pos + 1]]) as usize;
+    let _ext_len = u16::from_be_bytes([handshake[pos], handshake[pos + 1]]) as usize;
     pos += 2;
     while pos + 4 <= handshake.len() {
         let ext_type = u16::from_be_bytes([handshake[pos], handshake[pos + 1]]);
@@ -50,7 +50,7 @@ fn parse_sni(data: &[u8]) -> Option<String> {
             if ep + 2 > pos + ext_size {
                 break;
             }
-            let list_len = u16::from_be_bytes([handshake[ep], handshake[ep + 1]]) as usize;
+            let _list_len = u16::from_be_bytes([handshake[ep], handshake[ep + 1]]) as usize;
             ep += 2;
             while ep + 3 <= pos + ext_size {
                 let name_type = handshake[ep];
@@ -135,7 +135,7 @@ async fn handle_https_vhost_conn(
             .proxy_protocol_version
             .as_deref()
             .unwrap_or("v1");
-        if let Some(dst) = inbound.local_addr().ok() {
+        if let Ok(dst) = inbound.local_addr() {
             let header = crate::proxy_protocol::build_header(version, src_addr, dst);
             let _ = tunnel.write_all(&header).await;
         }

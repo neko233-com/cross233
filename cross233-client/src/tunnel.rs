@@ -16,6 +16,7 @@ impl<T> TunnelIo for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
 
 pub type TunnelStream = Box<dyn TunnelIo>;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn connect_tunnel(
     transport: TransportKind,
     server_addr: &str,

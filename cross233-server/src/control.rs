@@ -14,6 +14,7 @@ use tokio_rustls::TlsAcceptor;
 
 const MAX_INITIAL_MESSAGE_BYTES: usize = 16 * 1024;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_control_listener(
     listener: TcpListener,
     acceptor: TlsAcceptor,
@@ -59,6 +60,7 @@ pub async fn run_control_listener(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     tcp: TcpStream,
     remote_addr: SocketAddr,
@@ -141,6 +143,7 @@ where
     String::from_utf8(line).map_err(Into::into)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_control_session(
     mut stream: BufStream<TlsStream<TcpStream>>,
     first_msg: Message,
@@ -205,15 +208,16 @@ async fn handle_control_session(
     for svc in &assigned {
         match svc.effective_type() {
             "tcp" | "static" | "" => {
-                if !svc.is_vhost() && svc.remote_port != 0 {
-                    if !state.is_listener_active(svc.remote_port).await {
-                        state.mark_listener_active(svc.remote_port).await;
-                        spawn_tcp_listener_for_service(
-                            state.clone(),
-                            svc.name.clone(),
-                            svc.remote_port,
-                        );
-                    }
+                if !svc.is_vhost()
+                    && svc.remote_port != 0
+                    && !state.is_listener_active(svc.remote_port).await
+                {
+                    state.mark_listener_active(svc.remote_port).await;
+                    spawn_tcp_listener_for_service(
+                        state.clone(),
+                        svc.name.clone(),
+                        svc.remote_port,
+                    );
                 }
             }
             "udp" => {
@@ -440,7 +444,7 @@ async fn handle_visitor_connection(
     mut reader: BufStream<TlsStream<TcpStream>>,
     first_msg: Message,
     auth: AuthState,
-    state: Arc<SharedServiceState>,
+    _state: Arc<SharedServiceState>,
 ) -> anyhow::Result<()> {
     let cid = first_msg.client_id.clone().unwrap_or_default();
     let svc_name = first_msg.service_name.clone().unwrap_or_default();
@@ -565,7 +569,7 @@ async fn handle_inbound_tcp(
                     .proxy_protocol_version
                     .as_deref()
                     .unwrap_or("v1");
-                if let Some(dst) = inbound.local_addr().ok() {
+                if let Ok(dst) = inbound.local_addr() {
                     let header = crate::proxy_protocol::build_header(version, src_addr, dst);
                     let _ = tunnel.write_all(&header).await;
                 }

@@ -14,7 +14,7 @@ impl<W: Write> CompressWriter<W> {
         }
     }
 
-    pub fn finish(mut self) -> io::Result<W> {
+    pub fn finish(self) -> io::Result<W> {
         self.inner.finish()
     }
 }

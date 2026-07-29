@@ -26,8 +26,8 @@ use crate::web::WebState;
 // sequential: the server keeps one pending tunnel id, and the HMAC challenge
 // is never raced by concurrent connections.
 const TCP_TUNNEL_ATTEMPTS: u8 = 3;
-const TCP_TUNNEL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
-const TCP_TUNNEL_RETRY_DELAY: Duration = Duration::from_millis(200);
+const TCP_TUNNEL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+const TCP_TUNNEL_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 struct NoVerifier;
@@ -148,7 +148,10 @@ impl Client {
 
     pub async fn run(&self) -> Result<()> {
         let mut backoff = 3u64;
-        let max_backoff = 30u64;
+        // Keep service registration responsive when an upstream edge
+        // intermittently drops new TLS handshakes.  Longer exponential waits
+        // turn a short network blip into a prolonged public-service outage.
+        let max_backoff = 6u64;
 
         loop {
             tokio::select! {
@@ -485,6 +488,7 @@ async fn read_ndjson<R: AsyncBufReadExt + Unpin>(r: &mut R) -> Result<Message> {
     Ok(msg)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_open(
     tunnel_id: &str,
     remote_address: &str,
@@ -856,19 +860,21 @@ mod tests {
             hello
         });
 
-        let mut cfg = ClientConfig::default();
-        cfg.server = addr.to_string();
-        cfg.server_name = "localhost".to_string();
-        cfg.auth_key = "test-key".to_string();
-        cfg.ca_file = cert_path.to_string_lossy().to_string();
-        cfg.client_id = "session-test".to_string();
-        cfg.services = vec![Service {
-            name: "local-http".to_string(),
-            ty: Some("tcp".to_string()),
-            local_addr: "127.0.0.1:80".to_string(),
-            remote_port: 60080,
+        let cfg = ClientConfig {
+            server: addr.to_string(),
+            server_name: "localhost".to_string(),
+            auth_key: "test-key".to_string(),
+            ca_file: cert_path.to_string_lossy().to_string(),
+            client_id: "session-test".to_string(),
+            services: vec![Service {
+                name: "local-http".to_string(),
+                ty: Some("tcp".to_string()),
+                local_addr: "127.0.0.1:80".to_string(),
+                remote_port: 60080,
+                ..Default::default()
+            }],
             ..Default::default()
-        }];
+        };
 
         let web_state = crate::web::new_state();
         let client =

@@ -39,7 +39,7 @@ fn check_basic_auth(data: &[u8], user: &str, pass: &str) -> bool {
     for line in header_str.split("\r\n") {
         let lower = line.to_ascii_lowercase();
         if lower.starts_with("authorization:") || lower.starts_with("proxy-authorization:") {
-            let val = line.splitn(2, ':').nth(1).unwrap_or("").trim();
+            let val = line.split_once(':').map_or("", |(_, value)| value).trim();
             if let Some(b64) = val
                 .strip_prefix("Basic ")
                 .or_else(|| val.strip_prefix("basic "))
@@ -130,7 +130,7 @@ async fn handle_http_vhost_conn(
             .proxy_protocol_version
             .as_deref()
             .unwrap_or("v1");
-        if let Some(dst) = inbound.local_addr().ok() {
+        if let Ok(dst) = inbound.local_addr() {
             let header = crate::proxy_protocol::build_header(version, src_addr, dst);
             let _ = tunnel.write_all(&header).await;
         }

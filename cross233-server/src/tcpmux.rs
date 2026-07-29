@@ -78,7 +78,7 @@ async fn handle_tcpmux_conn(
             .proxy_protocol_version
             .as_deref()
             .unwrap_or("v1");
-        if let Some(dst) = inbound.local_addr().ok() {
+        if let Ok(dst) = inbound.local_addr() {
             let header = crate::proxy_protocol::build_header(version, src_addr, dst);
             let _ = tunnel.write_all(&header).await;
         }

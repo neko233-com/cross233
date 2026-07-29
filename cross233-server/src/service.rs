@@ -147,9 +147,7 @@ impl SharedServiceState {
                 }
             } else if svc.is_tcp() && !svc.is_vhost() {
                 let mut ports = self.allocated_ports.write().await;
-                if !ports.contains_key(&svc.remote_port) {
-                    ports.insert(svc.remote_port, name.clone());
-                }
+                ports.entry(svc.remote_port).or_insert_with(|| name.clone());
             }
 
             let entry = Arc::new(ServiceEntry::new(
@@ -192,8 +190,8 @@ impl SharedServiceState {
         for _ in 0..(self.port_max - self.port_min + 1) {
             let idx = self.next_port.fetch_add(1, Ordering::Relaxed);
             let port = self.port_min + (idx % (self.port_max - self.port_min + 1) as usize) as u16;
-            if !ports.contains_key(&port) {
-                ports.insert(port, name.to_string());
+            if let std::collections::hash_map::Entry::Vacant(entry) = ports.entry(port) {
+                entry.insert(name.to_string());
                 return Some(port);
             }
         }

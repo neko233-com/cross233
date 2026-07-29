@@ -74,14 +74,14 @@ pub fn connector(trusted_cert_der: &[u8]) -> TlsConnector {
 }
 
 /// Build a server config from PEM cert + key files' contents.
-pub fn server_config_pem(cert_pem: &[u8], key_pem: &[u8]) -> RustlsServerConfig {
+pub fn server_config_pem(mut cert_pem: &[u8], mut key_pem: &[u8]) -> RustlsServerConfig {
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem.as_ref())
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem)
         .collect::<Result<_, _>>()
         .expect("parse server cert pem");
-    let key = rustls_pemfile::private_key(&mut key_pem.as_ref())
+    let key = rustls_pemfile::private_key(&mut key_pem)
         .expect("parse server key pem")
         .expect("server key present");
     RustlsServerConfig::builder()
@@ -91,12 +91,12 @@ pub fn server_config_pem(cert_pem: &[u8], key_pem: &[u8]) -> RustlsServerConfig 
 }
 
 /// Build a client config trusting a PEM cert as root.
-pub fn client_config_pem(trusted_pem: &[u8]) -> RustlsClientConfig {
+pub fn client_config_pem(mut trusted_pem: &[u8]) -> RustlsClientConfig {
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
     let mut roots = RootCertStore::empty();
-    for c in rustls_pemfile::certs(&mut trusted_pem.as_ref())
+    for c in rustls_pemfile::certs(&mut trusted_pem)
         .collect::<Result<Vec<_>, _>>()
         .expect("parse trusted pem")
     {
@@ -108,11 +108,11 @@ pub fn client_config_pem(trusted_pem: &[u8]) -> RustlsClientConfig {
 }
 
 /// Parse PEM cert + key files into DER byte vectors for [`server_config`].
-pub fn load_cert_key_der(cert_pem: &[u8], key_pem: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem.as_ref())
+pub fn load_cert_key_der(mut cert_pem: &[u8], mut key_pem: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem)
         .collect::<Result<_, _>>()
         .expect("parse server cert pem");
-    let key = rustls_pemfile::private_key(&mut key_pem.as_ref())
+    let key = rustls_pemfile::private_key(&mut key_pem)
         .expect("parse server key pem")
         .expect("server key present");
     (
@@ -127,8 +127,8 @@ pub fn load_cert_key_der(cert_pem: &[u8], key_pem: &[u8]) -> (Vec<u8>, Vec<u8>) 
 }
 
 /// Extract the (first) certificate DER from a PEM trust file.
-pub fn load_trusted_cert_der(pem: &[u8]) -> Vec<u8> {
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut pem.as_ref())
+pub fn load_trusted_cert_der(mut pem: &[u8]) -> Vec<u8> {
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut pem)
         .collect::<Result<_, _>>()
         .expect("parse trusted cert pem");
     certs

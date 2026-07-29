@@ -126,7 +126,7 @@ fn encode(p: &Packet) -> BytesMut {
 }
 
 fn decode(buf: &[u8]) -> Option<Packet> {
-    if buf.len() < HEADER_LEN || &buf[0..4] != MAGIC {
+    if buf.len() < HEADER_LEN || buf[0..4] != MAGIC {
         return None;
     }
     let flags = buf[4];
@@ -518,10 +518,8 @@ async fn handle_packet(core: &CoreRef, p: Packet) {
                 }
                 let mut msg = Vec::with_capacity(total * MAX_PAYLOAD);
                 if let Some(mut asm) = st.assemblers.remove(&p.msg_id) {
-                    for f in asm.frags.drain(..) {
-                        if let Some(b) = f {
-                            msg.extend_from_slice(&b);
-                        }
+                    for b in asm.frags.drain(..).flatten() {
+                        msg.extend_from_slice(&b);
                     }
                 }
                 st.delivered.insert(p.msg_id, ());
@@ -618,9 +616,12 @@ fn send_frags(core: &CoreRef, msg_id: u32, data: &[u8], stream: Stream, _frags: 
 
 // ---- Public connection handle ---------------------------------------------
 
+type Delivery = (Vec<u8>, u8);
+type DeliveryRx = Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Delivery>>>;
+
 #[derive(Clone)]
 pub struct Conn {
-    deliver_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<(Vec<u8>, u8)>>>,
+    deliver_rx: DeliveryRx,
     ctrl_tx: mpsc::UnboundedSender<BytesMut>,
     core: CoreRef,
 }
@@ -704,7 +705,7 @@ impl Conn {
                 }
             }
             Stream::Critical | Stream::Batch => {
-                let frags = ((data.len() + MAX_PAYLOAD - 1) / MAX_PAYLOAD) as u16;
+                let frags = data.len().div_ceil(MAX_PAYLOAD) as u16;
                 {
                     let mut st = self.core.state.lock().await;
                     st.in_flight.insert(
@@ -976,15 +977,10 @@ mod tests {
         tokio::spawn(async move {
             let conn = l.accept().await.unwrap();
             let mut buf = vec![0u8; 1_000_000];
-            loop {
-                match conn.recv(&mut buf, Duration::from_secs(5)).await {
-                    Ok((n, s)) => {
-                        let data = buf[..n].to_vec();
-                        if conn.send_stream(&data, Stream::from_u8(s)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
+            while let Ok((n, s)) = conn.recv(&mut buf, Duration::from_secs(5)).await {
+                let data = buf[..n].to_vec();
+                if conn.send_stream(&data, Stream::from_u8(s)).await.is_err() {
+                    break;
                 }
             }
         });
@@ -1039,15 +1035,10 @@ mod tests {
         tokio::spawn(async move {
             if let Some(conn) = accept_rx.recv().await {
                 let mut buf = vec![0u8; 1_000_000];
-                loop {
-                    match conn.recv(&mut buf, Duration::from_secs(10)).await {
-                        Ok((n, _)) => {
-                            let d = buf[..n].to_vec();
-                            if conn.send(&d).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
+                while let Ok((n, _)) = conn.recv(&mut buf, Duration::from_secs(10)).await {
+                    let d = buf[..n].to_vec();
+                    if conn.send(&d).await.is_err() {
+                        break;
                     }
                 }
             }

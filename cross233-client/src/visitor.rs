@@ -1,11 +1,10 @@
 use anyhow::{anyhow, Context, Result};
 use cross233_protocol::Message;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::{TlsConnector, TlsStream};
+use tokio_rustls::TlsConnector;
 
 use crate::config::VisitorConfig;
 use crate::tunnel;
@@ -16,7 +15,7 @@ pub async fn run_visitor(
     server_addr: &str,
     client_id: &str,
     auth_key: &str,
-    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> Result<()> {
     match cfg.ty.as_str() {
         "stcp" => {
@@ -128,6 +127,7 @@ async fn handle_stcp_conn(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub struct SudpVisitor {
     sock: tokio::net::UdpSocket,
     out_tx: mpsc::UnboundedSender<Message>,

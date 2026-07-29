@@ -281,7 +281,7 @@ async fn auth_middleware(
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ServiceInfo {
+pub struct ServiceInfo {
     name: String,
     ty: String,
     local_addr: String,
@@ -460,7 +460,7 @@ async fn get_config(State(state): State<Arc<WebState>>) -> Json<serde_json::Valu
     Json(v)
 }
 
-async fn reload_config(State(state): State<Arc<WebState>>) -> Json<serde_json::Value> {
+async fn reload_config(State(_state): State<Arc<WebState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({"ok": true}))
 }
 

@@ -1,5 +1,5 @@
 use clap::Parser;
-use cross233_client::{Client, ClientConfig, WebStateData};
+use cross233_client::{Client, ClientConfig};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -100,10 +100,12 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("no services or visitors configured; use --services or a config file");
     }
 
-    let mut state_data = cross233_client::WebStateData::default();
-    state_data.server_addr = cfg.server.clone();
-    state_data.client_id = cfg.client_id.clone();
-    state_data.services = cfg.enabled_services();
+    let state_data = cross233_client::WebStateData {
+        server_addr: cfg.server.clone(),
+        client_id: cfg.client_id.clone(),
+        services: cfg.enabled_services(),
+        ..Default::default()
+    };
     let web_state = std::sync::Arc::new(tokio::sync::RwLock::new(state_data));
 
     let shutdown = Arc::new(tokio::sync::Notify::new());

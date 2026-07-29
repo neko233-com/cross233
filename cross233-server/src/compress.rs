@@ -6,9 +6,7 @@ use std::io::{Read, Write};
 pub fn compress(data: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(data)?;
-    encoder
-        .finish()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    encoder.finish()
 }
 
 pub fn decompress(data: &[u8]) -> std::io::Result<Vec<u8>> {

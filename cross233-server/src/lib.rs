@@ -9,6 +9,7 @@ pub mod http_vhost;
 pub mod https_vhost;
 pub mod metrics;
 pub mod proxy_protocol;
+#[allow(clippy::single_match)]
 pub mod qcp;
 pub mod server;
 pub mod service;

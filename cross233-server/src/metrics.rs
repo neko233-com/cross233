@@ -41,14 +41,13 @@ pub struct MetricsCollector {
 
 impl MetricsCollector {
     pub fn new() -> Arc<Self> {
-        let m = Arc::new(Self {
+        Arc::new(Self {
             history: RwLock::new(VecDeque::with_capacity(MAX_HISTORY_POINTS)),
             service_history: RwLock::new(Vec::new()),
             last_total_tx: std::sync::atomic::AtomicU64::new(0),
             last_total_rx: std::sync::atomic::AtomicU64::new(0),
             last_collect: RwLock::new(Instant::now()),
-        });
-        m
+        })
     }
 
     pub async fn collect(&self, service_state: &super::service::SharedServiceState) {
