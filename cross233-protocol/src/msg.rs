@@ -34,6 +34,8 @@ pub struct Message {
     pub remote_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub healthy: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eof: Option<bool>,
     #[serde(default, rename = "qcpPort", skip_serializing_if = "Option::is_none")]
     pub qcp_port: Option<u16>,
     #[serde(
@@ -153,6 +155,33 @@ impl Message {
             address: Some(address.to_string()),
             local_address: Some(local_address.to_string()),
             service: Some(service),
+            ..Default::default()
+        }
+    }
+
+    /// Request a static HTTP response over the already-authenticated control
+    /// channel. `data` contains one complete HTTP request header block.
+    ///
+    /// Only the registered service name is sent. The client resolves that name
+    /// against its current session instead of trusting a server-provided local
+    /// path.
+    pub fn new_static_request(id: &str, service_name: &str, data: Vec<u8>) -> Self {
+        Self {
+            ty: "static_request".to_string(),
+            id: Some(id.to_string()),
+            service_name: Some(service_name.to_string()),
+            data: Some(data),
+            ..Default::default()
+        }
+    }
+
+    /// One chunk of a static HTTP response carried by the control channel.
+    pub fn new_static_response(id: &str, data: Vec<u8>, eof: bool) -> Self {
+        Self {
+            ty: "static_response".to_string(),
+            id: Some(id.to_string()),
+            data: Some(data),
+            eof: Some(eof),
             ..Default::default()
         }
     }

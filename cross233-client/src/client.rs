@@ -4,9 +4,9 @@ use std::io::Cursor;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
 use tokio::time::{interval, sleep, timeout, Instant};
 use tokio_rustls::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
@@ -28,6 +28,9 @@ use crate::web::WebState;
 const TCP_TUNNEL_ATTEMPTS: u8 = 3;
 const TCP_TUNNEL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const TCP_TUNNEL_RETRY_DELAY: Duration = Duration::from_millis(100);
+const STATIC_CONTROL_REQUEST_BYTES: usize = 8 * 1024;
+const STATIC_CONTROL_OUTBOUND_QUEUE: usize = 32;
+const STATIC_CONTROL_MAX_IN_FLIGHT: usize = 4;
 
 #[derive(Debug)]
 struct NoVerifier;
@@ -254,6 +257,18 @@ impl Client {
             "authenticated, services registered"
         );
 
+        // A server asks by service name only. Resolve it against local client
+        // configuration so a server message cannot select an arbitrary local
+        // directory.
+        let static_service_roots: Arc<std::collections::HashMap<String, String>> = Arc::new(
+            services
+                .iter()
+                .filter(|service| service.effective_type() == "static")
+                .map(|service| (service.name.clone(), service.local_addr.clone()))
+                .collect(),
+        );
+        let static_response_slots = Arc::new(Semaphore::new(STATIC_CONTROL_MAX_IN_FLIGHT));
+
         {
             let mut s = self.web_state.write().await;
             s.connected = true;
@@ -269,11 +284,17 @@ impl Client {
         let mut rd = BufReader::new(rd);
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
+        let (static_out_tx, mut static_out_rx) =
+            mpsc::channel::<Message>(STATIC_CONTROL_OUTBOUND_QUEUE);
         let (shutdown_tx, _shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
 
         let writer_shutdown = shutdown_tx.clone();
         tokio::spawn(async move {
-            while let Some(msg) = out_rx.recv().await {
+            while let Some(msg) = tokio::select! {
+                Some(msg) = out_rx.recv() => Some(msg),
+                Some(msg) = static_out_rx.recv() => Some(msg),
+                else => None,
+            } {
                 if write_ndjson(&mut wr, &msg).await.is_err() {
                     break;
                 }
@@ -414,6 +435,47 @@ impl Client {
                                 }
                             });
                         }
+                        "static_request" => {
+                            let request_id = msg.id.clone().unwrap_or_default();
+                            let service_name = msg.service_name.clone().unwrap_or_default();
+                            let request = msg.data.clone().unwrap_or_default();
+                            if request_id.is_empty()
+                                || request.len() > STATIC_CONTROL_REQUEST_BYTES
+                            {
+                                tracing::debug!(
+                                    request_id = %request_id,
+                                    request_bytes = request.len(),
+                                    "invalid static control request"
+                                );
+                                continue;
+                            }
+                            let Some(root) = static_service_roots.get(&service_name).cloned() else {
+                                tracing::debug!(service = %service_name, "static control request targets no registered static service");
+                                continue;
+                            };
+                            let permit = match static_response_slots.clone().try_acquire_owned() {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    tracing::debug!(service = %service_name, "static control relay is busy; server will use tunnel fallback");
+                                    continue;
+                                }
+                            };
+                            let response_tx = static_out_tx.clone();
+
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                if let Err(error) = send_static_control_response(
+                                    &response_tx,
+                                    &request_id,
+                                    &root,
+                                    &request,
+                                )
+                                .await
+                                {
+                                    tracing::debug!(request_id = %request_id, service = %service_name, "static control response failed: {error:#}");
+                                }
+                            });
+                        }
                         "udp_response" => {
                             if let (Some(rp), Some(addr), Some(data)) = (msg.remote_port, msg.address.as_ref(), msg.data.as_ref()) {
                                 crate::udp::handle_udp_response(&udp_forwarders, rp, addr, data).await;
@@ -461,6 +523,89 @@ async fn run_static_health_check(
             }
         }
     }
+}
+
+async fn send_static_control_response(
+    out_tx: &mpsc::Sender<Message>,
+    request_id: &str,
+    root: &str,
+    request: &[u8],
+) -> Result<()> {
+    match crate::static_files::prepare_control_response(root, request).await {
+        crate::static_files::ControlResponse::Bytes(response) => {
+            send_static_response_bytes(out_tx, request_id, &response, true).await
+        }
+        crate::static_files::ControlResponse::File { headers, mut file } => {
+            send_static_response_bytes(out_tx, request_id, &headers, false).await?;
+
+            let mut chunk = [0_u8; crate::static_files::CONTROL_RESPONSE_CHUNK_BYTES];
+            loop {
+                match file.read(&mut chunk).await {
+                    Ok(0) => {
+                        send_static_response_chunk(out_tx, request_id, Vec::new(), true).await?;
+                        return Ok(());
+                    }
+                    Ok(count) => {
+                        send_static_response_chunk(
+                            out_tx,
+                            request_id,
+                            chunk[..count].to_vec(),
+                            false,
+                        )
+                        .await?;
+                    }
+                    Err(error) => {
+                        // Headers may already be public. End this response so
+                        // the server can close its peer instead of retaining a
+                        // pending static slot forever.
+                        let _ =
+                            send_static_response_chunk(out_tx, request_id, Vec::new(), true).await;
+                        return Err(error.into());
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn send_static_response_bytes(
+    out_tx: &mpsc::Sender<Message>,
+    request_id: &str,
+    bytes: &[u8],
+    final_chunk: bool,
+) -> Result<()> {
+    if bytes.is_empty() {
+        return send_static_response_chunk(out_tx, request_id, Vec::new(), final_chunk).await;
+    }
+
+    let chunk_count = bytes
+        .chunks(crate::static_files::CONTROL_RESPONSE_CHUNK_BYTES)
+        .count();
+    for (index, chunk) in bytes
+        .chunks(crate::static_files::CONTROL_RESPONSE_CHUNK_BYTES)
+        .enumerate()
+    {
+        send_static_response_chunk(
+            out_tx,
+            request_id,
+            chunk.to_vec(),
+            final_chunk && index + 1 == chunk_count,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn send_static_response_chunk(
+    out_tx: &mpsc::Sender<Message>,
+    request_id: &str,
+    data: Vec<u8>,
+    eof: bool,
+) -> Result<()> {
+    out_tx
+        .send(Message::new_static_response(request_id, data, eof))
+        .await
+        .map_err(|_| anyhow!("static control writer closed"))
 }
 
 fn static_root_is_available(root: &str) -> bool {

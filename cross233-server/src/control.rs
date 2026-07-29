@@ -1,5 +1,5 @@
 use crate::auth::AuthState;
-use crate::service::{SharedServiceState, TUNNEL_OPEN_TIMEOUT};
+use crate::service::{SharedServiceState, STATIC_RESPONSE_CHUNK_MAX, TUNNEL_OPEN_TIMEOUT};
 use crate::udp::UdpManager;
 use cross233_protocol::Message;
 use std::net::SocketAddr;
@@ -13,6 +13,9 @@ use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
 
 const MAX_INITIAL_MESSAGE_BYTES: usize = 16 * 1024;
+const STATIC_CONTROL_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+const STATIC_CONTROL_FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+const STATIC_CONTROL_RESPONSE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_control_listener(
@@ -284,6 +287,21 @@ async fn handle_control_session(
                                         state.report_health(&name, healthy).await;
                                     }
                                 }
+                                "static_response" => {
+                                    if let Some(id) = msg.id.as_deref() {
+                                        let delivered = state
+                                            .deliver_static_response(
+                                                &control_tx,
+                                                id,
+                                                msg.data.unwrap_or_default(),
+                                                msg.eof.unwrap_or(false),
+                                            )
+                                            .await;
+                                        if !delivered {
+                                            tracing::trace!(request_id = %id, client_id = %cid, "discarded static control response");
+                                        }
+                                    }
+                                }
                                 "udp_response" => {
                                     if let (Some(rport), Some(addr), Some(data)) =
                                         (msg.remote_port, msg.address.as_ref(), msg.data.as_ref())
@@ -344,6 +362,7 @@ async fn handle_control_session(
     }
 
     ping_task.abort();
+    state.cancel_static_responses_for_control(&control_tx).await;
 
     if state.is_current_control(&cid, &control_tx).await {
         if let Some(mgr) = &udp_mgr {
@@ -553,40 +572,228 @@ async fn handle_inbound_tcp(
 
     entry.current_conns.fetch_add(1, Ordering::Relaxed);
 
-    let result = match state
+    let result = if entry.config.effective_type() == "static" && !entry.config.proxy_protocol {
+        handle_static_inbound(
+            state.clone(),
+            &service_name,
+            entry.clone(),
+            &mut inbound,
+            src_addr,
+        )
+        .await
+    } else {
+        relay_inbound_tunnel(
+            state.clone(),
+            &service_name,
+            entry.clone(),
+            &mut inbound,
+            src_addr,
+            &[],
+        )
+        .await
+    };
+
+    entry.current_conns.fetch_sub(1, Ordering::Relaxed);
+    result
+}
+
+async fn handle_static_inbound(
+    state: Arc<SharedServiceState>,
+    service_name: &str,
+    entry: Arc<crate::service::ServiceEntry>,
+    inbound: &mut TcpStream,
+    src_addr: SocketAddr,
+) -> anyhow::Result<()> {
+    let capture = capture_static_request_headers(inbound).await?;
+
+    if let Some(request) = capture.control_request.as_ref() {
+        match relay_static_control_response(
+            state.clone(),
+            service_name,
+            entry.clone(),
+            inbound,
+            request,
+        )
+        .await
+        {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
+                tracing::debug!(service = %service_name, "static control response unavailable; using tunnel fallback");
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    // A client can reconnect after the header was read. Resolve once more so
+    // fallback does not send an open request through a stale control channel.
+    let current_entry = state
+        .get_service_by_name(service_name)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("service disconnected before tunnel fallback"))?;
+    relay_inbound_tunnel(
+        state,
+        service_name,
+        current_entry,
+        inbound,
+        src_addr,
+        &capture.replay,
+    )
+    .await
+}
+
+async fn relay_static_control_response(
+    state: Arc<SharedServiceState>,
+    service_name: &str,
+    entry: Arc<crate::service::ServiceEntry>,
+    inbound: &mut TcpStream,
+    request: &[u8],
+) -> anyhow::Result<bool> {
+    let (request_id, mut responses) = match state
+        .request_static_response(&entry, request.to_vec())
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::debug!(service = %service_name, "static control request unavailable: {error}");
+            return Ok(false);
+        }
+    };
+
+    let first = match timeout(STATIC_CONTROL_FIRST_RESPONSE_TIMEOUT, responses.recv()).await {
+        Ok(Some(chunk)) if !chunk.data.is_empty() => chunk,
+        Ok(Some(_)) | Ok(None) | Err(_) => {
+            state.cancel_static_response(&request_id).await;
+            return Ok(false);
+        }
+    };
+
+    let mut sent = 0_u64;
+    if let Err(error) = inbound.write_all(&first.data).await {
+        state.cancel_static_response(&request_id).await;
+        return Err(error.into());
+    }
+    sent += first.data.len() as u64;
+    let mut eof = first.eof;
+
+    while !eof {
+        let chunk = match timeout(STATIC_CONTROL_RESPONSE_IDLE_TIMEOUT, responses.recv()).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => {
+                state.cancel_static_response(&request_id).await;
+                return Err(anyhow::anyhow!("static control response ended before eof"));
+            }
+            Err(_) => {
+                state.cancel_static_response(&request_id).await;
+                return Err(anyhow::anyhow!("static control response idle timeout"));
+            }
+        };
+        if let Err(error) = inbound.write_all(&chunk.data).await {
+            state.cancel_static_response(&request_id).await;
+            return Err(error.into());
+        }
+        sent += chunk.data.len() as u64;
+        eof = chunk.eof;
+    }
+    inbound.flush().await?;
+    state
+        .record_traffic(service_name, sent, request.len() as u64)
+        .await;
+    Ok(true)
+}
+
+async fn relay_inbound_tunnel(
+    state: Arc<SharedServiceState>,
+    service_name: &str,
+    entry: Arc<crate::service::ServiceEntry>,
+    inbound: &mut TcpStream,
+    src_addr: SocketAddr,
+    replay: &[u8],
+) -> anyhow::Result<()> {
+    let mut tunnel = state
         .open_tunnel(
             &entry,
             Some(src_addr),
             inbound.local_addr().ok(),
             TUNNEL_OPEN_TIMEOUT,
         )
-        .await
-    {
-        Ok(mut tunnel) => {
-            if entry.config.proxy_protocol {
-                let version = entry
-                    .config
-                    .proxy_protocol_version
-                    .as_deref()
-                    .unwrap_or("v1");
-                if let Ok(dst) = inbound.local_addr() {
-                    let header = crate::proxy_protocol::build_header(version, src_addr, dst);
-                    let _ = tunnel.write_all(&header).await;
-                }
+        .await?;
+
+    if entry.config.proxy_protocol {
+        let version = entry
+            .config
+            .proxy_protocol_version
+            .as_deref()
+            .unwrap_or("v1");
+        if let Ok(dst) = inbound.local_addr() {
+            let header = crate::proxy_protocol::build_header(version, src_addr, dst);
+            tunnel.write_all(&header).await?;
+        }
+    }
+    if !replay.is_empty() {
+        tunnel.write_all(replay).await?;
+        tunnel.flush().await?;
+    }
+
+    match tokio::io::copy_bidirectional(&mut tunnel, inbound).await {
+        Ok((tx, rx)) => {
+            state.record_traffic(service_name, tx, rx).await;
+            Ok(())
+        }
+        Err(error) => Err(anyhow::anyhow!("copy error: {}", error)),
+    }
+}
+
+struct StaticRequestCapture {
+    control_request: Option<Vec<u8>>,
+    replay: Vec<u8>,
+}
+
+async fn capture_static_request_headers(
+    inbound: &mut TcpStream,
+) -> anyhow::Result<StaticRequestCapture> {
+    let deadline = Instant::now() + STATIC_CONTROL_HEADER_TIMEOUT;
+    let mut replay = Vec::with_capacity(1024);
+    let mut buffer = [0_u8; 1024];
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(StaticRequestCapture {
+                control_request: None,
+                replay,
+            });
+        }
+        let count = match timeout(remaining, inbound.read(&mut buffer)).await {
+            Ok(Ok(0)) | Err(_) => {
+                return Ok(StaticRequestCapture {
+                    control_request: None,
+                    replay,
+                });
             }
-            match tokio::io::copy_bidirectional(&mut tunnel, &mut inbound).await {
-                Ok((tx, rx)) => {
-                    state.record_traffic(&service_name, tx, rx).await;
-                    Ok(())
-                }
-                Err(e) => Err(anyhow::anyhow!("copy error: {}", e)),
+            Ok(Ok(count)) => count,
+            Ok(Err(error)) => return Err(error.into()),
+        };
+        replay.extend_from_slice(&buffer[..count]);
+
+        if let Some(end) = replay
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+        {
+            if end <= STATIC_RESPONSE_CHUNK_MAX {
+                return Ok(StaticRequestCapture {
+                    control_request: Some(replay[..end].to_vec()),
+                    replay,
+                });
             }
         }
-        Err(error) => Err(error),
-    };
-
-    entry.current_conns.fetch_sub(1, Ordering::Relaxed);
-    result
+        if replay.len() >= STATIC_RESPONSE_CHUNK_MAX {
+            return Ok(StaticRequestCapture {
+                control_request: None,
+                replay,
+            });
+        }
+    }
 }
 
 #[cfg(test)]

@@ -5,13 +5,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::{timeout, Duration};
 
 /// Maximum time an inbound connection waits for the client to attach its
 /// authenticated reverse tunnel.  This leaves room for the client's bounded
 /// TCP retry sequence when an upstream path transiently drops a TLS handshake.
 pub const TUNNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+pub const STATIC_RESPONSE_CHUNK_MAX: usize = 8 * 1024;
+const STATIC_RESPONSE_QUEUE_CAPACITY: usize = 16;
+const STATIC_CONTROL_MAX_IN_FLIGHT: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct WorkReq {
@@ -19,6 +22,14 @@ pub struct WorkReq {
     pub service_name: String,
     pub src_addr: Option<SocketAddr>,
     pub dst_addr: Option<SocketAddr>,
+}
+
+/// A bounded response chunk returned by a client static service over the
+/// authenticated control channel.
+#[derive(Debug)]
+pub struct StaticResponseChunk {
+    pub data: Vec<u8>,
+    pub eof: bool,
 }
 
 pub trait TunnelIo: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -78,6 +89,15 @@ impl ServiceEntry {
 
 type PendingWorkSender = oneshot::Sender<Result<TunnelStream, String>>;
 
+struct PendingStaticResponse {
+    /// Session that requested this response. Static response ids are random,
+    /// but binding them to this channel prevents another authenticated client
+    /// from injecting bytes into a different client's public request.
+    owner: mpsc::UnboundedSender<Message>,
+    sender: mpsc::Sender<StaticResponseChunk>,
+    _permit: OwnedSemaphorePermit,
+}
+
 pub struct SharedServiceState {
     pub services_by_name: RwLock<HashMap<String, Arc<ServiceEntry>>>,
     pub services_by_group: RwLock<HashMap<String, Vec<Arc<ServiceEntry>>>>,
@@ -88,6 +108,8 @@ pub struct SharedServiceState {
     port_min: u16,
     port_max: u16,
     pub pending_work: RwLock<HashMap<String, PendingWorkSender>>,
+    pending_static: RwLock<HashMap<String, PendingStaticResponse>>,
+    static_slots: Arc<Semaphore>,
     pub pending_tunnels_stcp: RwLock<HashMap<String, mpsc::Sender<WorkReq>>>,
     pub client_control_tx: RwLock<HashMap<String, mpsc::UnboundedSender<Message>>>,
     qcp_port: u16,
@@ -115,6 +137,8 @@ impl SharedServiceState {
             port_min,
             port_max,
             pending_work: RwLock::new(HashMap::new()),
+            pending_static: RwLock::new(HashMap::new()),
+            static_slots: Arc::new(Semaphore::new(STATIC_CONTROL_MAX_IN_FLIGHT)),
             pending_tunnels_stcp: RwLock::new(HashMap::new()),
             client_control_tx: RwLock::new(HashMap::new()),
             qcp_port,
@@ -342,6 +366,113 @@ impl SharedServiceState {
         self.pending_work.write().await.remove(id);
     }
 
+    /// Ask a static client to serve an HTTP request over its existing control
+    /// session. This avoids opening a fresh data-plane TLS connection for a
+    /// directory that is already known to be local to that client.
+    pub async fn request_static_response(
+        &self,
+        service: &Arc<ServiceEntry>,
+        request: Vec<u8>,
+    ) -> anyhow::Result<(String, mpsc::Receiver<StaticResponseChunk>)> {
+        if request.len() > STATIC_RESPONSE_CHUNK_MAX {
+            return Err(anyhow::anyhow!("static request headers exceed relay limit"));
+        }
+        let permit = self
+            .static_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| anyhow::anyhow!("static control relay is busy"))?;
+        let id = random_id();
+        let (tx, rx) = mpsc::channel(STATIC_RESPONSE_QUEUE_CAPACITY);
+        self.pending_static.write().await.insert(
+            id.clone(),
+            PendingStaticResponse {
+                owner: service.control_tx.clone(),
+                sender: tx,
+                _permit: permit,
+            },
+        );
+
+        let message = Message::new_static_request(&id, &service.config.name, request);
+        if let Err(error) = service.control_tx.send(message) {
+            self.cancel_static_response(&id).await;
+            return Err(anyhow::anyhow!("failed to send static request: {}", error));
+        }
+        Ok((id, rx))
+    }
+
+    /// Deliver a client response chunk if it came from the session that owns
+    /// this request. The bounded queue protects the control reader from a
+    /// slow public peer; a full queue cancels only this response.
+    pub async fn deliver_static_response(
+        &self,
+        control_tx: &mpsc::UnboundedSender<Message>,
+        id: &str,
+        data: Vec<u8>,
+        eof: bool,
+    ) -> bool {
+        if data.len() > STATIC_RESPONSE_CHUNK_MAX {
+            self.cancel_static_response_for_control(id, control_tx)
+                .await;
+            return false;
+        }
+
+        let sender = {
+            let pending = self.pending_static.read().await;
+            match pending.get(id) {
+                Some(response) if response.owner.same_channel(control_tx) => {
+                    response.sender.clone()
+                }
+                _ => return false,
+            }
+        };
+
+        match sender.try_send(StaticResponseChunk { data, eof }) {
+            Ok(()) => {
+                if eof {
+                    self.cancel_static_response_for_control(id, control_tx)
+                        .await;
+                }
+                true
+            }
+            Err(_) => {
+                self.cancel_static_response_for_control(id, control_tx)
+                    .await;
+                false
+            }
+        }
+    }
+
+    pub async fn cancel_static_response(&self, id: &str) {
+        self.pending_static.write().await.remove(id);
+    }
+
+    async fn cancel_static_response_for_control(
+        &self,
+        id: &str,
+        control_tx: &mpsc::UnboundedSender<Message>,
+    ) {
+        let mut pending = self.pending_static.write().await;
+        if pending
+            .get(id)
+            .is_some_and(|response| response.owner.same_channel(control_tx))
+        {
+            pending.remove(id);
+        }
+    }
+
+    /// Remove only work owned by a closing session. A stale session must not
+    /// cancel a response already transferred to a reconnecting client.
+    pub async fn cancel_static_responses_for_control(
+        &self,
+        control_tx: &mpsc::UnboundedSender<Message>,
+    ) {
+        self.pending_static
+            .write()
+            .await
+            .retain(|_, response| !response.owner.same_channel(control_tx));
+    }
+
     pub async fn complete_tunnel(&self, id: &str, stream: TunnelStream) -> bool {
         let mut pending = self.pending_work.write().await;
         if let Some(tx) = pending.remove(id) {
@@ -429,6 +560,16 @@ mod tests {
         }
     }
 
+    fn static_test_service() -> Service {
+        Service {
+            name: "static-session-test".to_string(),
+            ty: Some("static".to_string()),
+            local_addr: "/tmp/static".to_string(),
+            remote_port: 60080,
+            ..Default::default()
+        }
+    }
+
     #[tokio::test]
     async fn stale_session_cannot_unregister_new_session_services() {
         let state = SharedServiceState::new(60080, 60080, 0);
@@ -478,5 +619,88 @@ mod tests {
         };
         assert!(error.to_string().contains("tunnel open timeout"));
         assert!(state.pending_work.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn static_response_requires_owning_control_session() {
+        let state = SharedServiceState::new(60080, 60080, 0);
+        let (owner_tx, mut owner_rx) = mpsc::unbounded_channel();
+        state
+            .register_services("client", owner_tx.clone(), vec![static_test_service()])
+            .await;
+        let service = state
+            .get_service_by_name("static-session-test")
+            .await
+            .unwrap();
+
+        let (request_id, mut response_rx) = state
+            .request_static_response(
+                &service,
+                b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n".to_vec(),
+            )
+            .await
+            .unwrap();
+        let request = timeout(Duration::from_secs(1), owner_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.ty, "static_request");
+        assert_eq!(request.service_name.as_deref(), Some("static-session-test"));
+        assert!(request.service.is_none());
+
+        let (other_tx, _other_rx) = mpsc::unbounded_channel();
+        assert!(
+            !state
+                .deliver_static_response(&other_tx, &request_id, b"spoof".to_vec(), true)
+                .await
+        );
+        assert!(timeout(Duration::from_millis(25), response_rx.recv())
+            .await
+            .is_err());
+
+        assert!(
+            state
+                .deliver_static_response(&owner_tx, &request_id, b"ok".to_vec(), true)
+                .await
+        );
+        let response = response_rx.recv().await.unwrap();
+        assert_eq!(response.data, b"ok");
+        assert!(response.eof);
+        assert!(state.pending_static.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn full_static_response_queue_cancels_only_that_request() {
+        let state = SharedServiceState::new(60080, 60080, 0);
+        let (owner_tx, mut owner_rx) = mpsc::unbounded_channel();
+        state
+            .register_services("client", owner_tx.clone(), vec![static_test_service()])
+            .await;
+        let service = state
+            .get_service_by_name("static-session-test")
+            .await
+            .unwrap();
+        let (request_id, _response_rx) = state
+            .request_static_response(
+                &service,
+                b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n".to_vec(),
+            )
+            .await
+            .unwrap();
+        let _ = owner_rx.recv().await;
+
+        for _ in 0..STATIC_RESPONSE_QUEUE_CAPACITY {
+            assert!(
+                state
+                    .deliver_static_response(&owner_tx, &request_id, b"chunk".to_vec(), false)
+                    .await
+            );
+        }
+        assert!(
+            !state
+                .deliver_static_response(&owner_tx, &request_id, b"overflow".to_vec(), false)
+                .await
+        );
+        assert!(state.pending_static.read().await.is_empty());
     }
 }
