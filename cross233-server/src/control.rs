@@ -215,18 +215,51 @@ async fn handle_control_session(
                     && svc.remote_port != 0
                     && !state.is_listener_active(svc.remote_port).await
                 {
-                    state.mark_listener_active(svc.remote_port).await;
-                    spawn_tcp_listener_for_service(
+                    if let Err(error) = start_tcp_listener_for_service(
                         state.clone(),
                         svc.name.clone(),
                         svc.remote_port,
-                    );
+                    )
+                    .await
+                    {
+                        let message = format!(
+                            "cannot expose service {} on {}:{}: {}",
+                            svc.name,
+                            state.proxy_bind(),
+                            svc.remote_port,
+                            error
+                        );
+                        cleanup_registered_session(&state, udp_mgr.as_ref(), &cid, &control_tx)
+                            .await;
+                        send_line(
+                            &mut stream,
+                            &serde_json::to_string(&Message::new_error(&message))?,
+                        )
+                        .await?;
+                        return Err(anyhow::anyhow!(message));
+                    }
                 }
             }
             "udp" => {
                 if let Some(mgr) = &udp_mgr {
                     if svc.remote_port != 0 {
-                        let _ = mgr.start_service(&svc.name, svc.remote_port).await;
+                        if let Err(error) = mgr.start_service(&svc.name, svc.remote_port).await {
+                            let message = format!(
+                                "cannot expose UDP service {} on {}:{}: {}",
+                                svc.name,
+                                state.proxy_bind(),
+                                svc.remote_port,
+                                error
+                            );
+                            cleanup_registered_session(&state, udp_mgr.as_ref(), &cid, &control_tx)
+                                .await;
+                            send_line(
+                                &mut stream,
+                                &serde_json::to_string(&Message::new_error(&message))?,
+                            )
+                            .await?;
+                            return Err(anyhow::anyhow!(message));
+                        }
                     }
                 }
             }
@@ -235,7 +268,10 @@ async fn handle_control_session(
     }
 
     let ready_msg = Message::new_ready(assigned, qcp_port, qcp_tunnel_port);
-    send_line(&mut stream, &serde_json::to_string(&ready_msg)?).await?;
+    if let Err(error) = send_line(&mut stream, &serde_json::to_string(&ready_msg)?).await {
+        cleanup_registered_session(&state, udp_mgr.as_ref(), &cid, &control_tx).await;
+        return Err(error.into());
+    }
 
     tracing::info!(client_id = %cid, addr = %remote_addr, "client authenticated");
 
@@ -253,7 +289,7 @@ async fn handle_control_session(
 
     let mut last_activity = Instant::now();
     let mut msg_line = String::new();
-    loop {
+    'session: loop {
         msg_line.clear();
         tokio::select! {
             read_res = timeout(Duration::from_secs(90), stream.read_line(&mut msg_line)) => {
@@ -270,8 +306,14 @@ async fn handle_control_session(
                                 }
                             }
                             if !out_buf.is_empty() {
-                                stream.write_all(&out_buf).await?;
-                                stream.flush().await?;
+                                if let Err(error) = stream.write_all(&out_buf).await {
+                                    tracing::debug!(client_id = %cid, "write error: {}", error);
+                                    break 'session;
+                                }
+                                if let Err(error) = stream.flush().await {
+                                    tracing::debug!(client_id = %cid, "flush error: {}", error);
+                                    break 'session;
+                                }
                             }
                             continue;
                         }
@@ -326,8 +368,14 @@ async fn handle_control_session(
                             }
                         }
                         if !out_buf.is_empty() {
-                            stream.write_all(&out_buf).await?;
-                            stream.flush().await?;
+                            if let Err(error) = stream.write_all(&out_buf).await {
+                                tracing::debug!(client_id = %cid, "write error: {}", error);
+                                break 'session;
+                            }
+                            if let Err(error) = stream.flush().await {
+                                tracing::debug!(client_id = %cid, "flush error: {}", error);
+                                break 'session;
+                            }
                         }
                     }
                     Ok(Err(e)) => {
@@ -347,44 +395,63 @@ async fn handle_control_session(
                             }
                         }
                         if !out_buf.is_empty() {
-                            stream.write_all(&out_buf).await?;
-                            stream.flush().await?;
+                            if let Err(error) = stream.write_all(&out_buf).await {
+                                tracing::debug!(client_id = %cid, "write error: {}", error);
+                                break 'session;
+                            }
+                            if let Err(error) = stream.flush().await {
+                                tracing::debug!(client_id = %cid, "flush error: {}", error);
+                                break 'session;
+                            }
                         }
                     }
                 }
             }
             Some(msg) = control_rx.recv() => {
                 if let Ok(s) = serde_json::to_string(&msg) {
-                    send_line(&mut stream, &s).await?;
+                    if let Err(error) = send_line(&mut stream, &s).await {
+                        tracing::debug!(client_id = %cid, "write error: {}", error);
+                        break 'session;
+                    }
                 }
             }
         }
     }
 
     ping_task.abort();
-    state.cancel_static_responses_for_control(&control_tx).await;
+    cleanup_registered_session(&state, udp_mgr.as_ref(), &cid, &control_tx).await;
+    Ok(())
+}
 
-    if state.is_current_control(&cid, &control_tx).await {
-        if let Some(mgr) = &udp_mgr {
-            let client_svcs = state
+async fn cleanup_registered_session(
+    state: &Arc<SharedServiceState>,
+    udp_mgr: Option<&Arc<UdpManager>>,
+    client_id: &str,
+    control_tx: &mpsc::UnboundedSender<Message>,
+) {
+    state.cancel_static_responses_for_control(control_tx).await;
+    if state.is_current_control(client_id, control_tx).await {
+        if let Some(mgr) = udp_mgr {
+            let client_services = state
                 .client_services
                 .read()
                 .await
-                .get(&cid)
+                .get(client_id)
                 .cloned()
                 .unwrap_or_default();
-            for name in &client_svcs {
+            for name in &client_services {
                 mgr.stop_service(name).await;
             }
         }
-
-        if state.unregister_client_if_current(&cid, &control_tx).await {
-            tracing::info!(client_id = %cid, "client disconnected");
+        if state
+            .unregister_client_if_current(client_id, control_tx)
+            .await
+        {
+            tracing::info!(client_id, "client disconnected");
         }
     } else {
-        tracing::debug!(client_id = %cid, "stale client session disconnected");
+        tracing::debug!(client_id, "stale client session disconnected");
     }
-    Ok(())
 }
 
 pub(crate) async fn handle_tunnel_connection<S>(
@@ -505,21 +572,20 @@ async fn send_line<W: AsyncWriteExt + Unpin>(w: &mut W, s: &str) -> std::io::Res
     w.flush().await
 }
 
-pub fn spawn_tcp_listener_for_service(
+pub async fn start_tcp_listener_for_service(
     state: Arc<SharedServiceState>,
     service_name: String,
     port: u16,
-) {
-    let addr = format!("0.0.0.0:{}", port);
-    tokio::spawn(async move {
-        let listener = match TcpListener::bind(&addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!(service = %service_name, addr = %addr, "bind failed: {}", e);
-                state.remove_listener_handle(port).await;
-                return;
-            }
-        };
+) -> anyhow::Result<()> {
+    if state.is_listener_active(port).await {
+        return Ok(());
+    }
+
+    let addr = format!("{}:{}", state.proxy_bind(), port);
+    let listener = TcpListener::bind(&addr).await?;
+    let task_state = state.clone();
+    let task_service_name = service_name.clone();
+    let handle = tokio::spawn(async move {
         tracing::info!(service = %service_name, addr = %addr, "TCP listener started");
         loop {
             let (tcp, src_addr) = match listener.accept().await {
@@ -532,7 +598,7 @@ pub fn spawn_tcp_listener_for_service(
                     break;
                 }
             };
-            let state = state.clone();
+            let state = task_state.clone();
             tokio::spawn(async move {
                 let Some(svc_name) = state.get_service_name_by_port(port).await else {
                     tracing::warn!(port, peer = %src_addr, "inbound TCP connection has no registered service");
@@ -544,8 +610,12 @@ pub fn spawn_tcp_listener_for_service(
                 }
             });
         }
-        state.remove_listener_handle(port).await;
+        task_state.remove_listener_handle(port, &service_name).await;
     });
+    state
+        .register_listener(port, task_service_name, handle.abort_handle())
+        .await;
+    Ok(())
 }
 
 async fn handle_inbound_tcp(
@@ -815,7 +885,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_listener_survives_client_reconnect() {
+    async fn tcp_listener_stops_and_can_restart_after_client_disconnect() {
         let port = unused_tcp_port();
         let state = SharedServiceState::new(port, port, 0);
         let service = Service {
@@ -830,8 +900,9 @@ mod tests {
         state
             .register_services("client", first_tx, vec![service.clone()])
             .await;
-        state.mark_listener_active(port).await;
-        spawn_tcp_listener_for_service(state.clone(), service.name.clone(), port);
+        start_tcp_listener_for_service(state.clone(), service.name.clone(), port)
+            .await
+            .unwrap();
 
         let first_stream = timeout(Duration::from_secs(1), async {
             loop {
@@ -850,14 +921,26 @@ mod tests {
         drop(first_stream);
 
         state.unregister_client("client").await;
-        assert!(state.is_listener_active(port).await);
+        assert!(!state.is_listener_active(port).await);
 
         let (second_tx, mut second_rx) = mpsc::unbounded_channel();
         state
-            .register_services("client", second_tx, vec![service])
+            .register_services("client", second_tx, vec![service.clone()])
             .await;
+        start_tcp_listener_for_service(state.clone(), service.name.clone(), port)
+            .await
+            .unwrap();
 
-        let second_stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let second_stream = timeout(Duration::from_secs(1), async {
+            loop {
+                match TcpStream::connect(("127.0.0.1", port)).await {
+                    Ok(stream) => break stream,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .expect("listener should restart");
         let second_open = next_open(&mut second_rx).await;
         state
             .reject_tunnel(second_open.id.as_deref().unwrap(), "test complete")

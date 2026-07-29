@@ -25,6 +25,13 @@ struct Args {
 
     #[arg(long, help = "TLS key file")]
     key_file: Option<String>,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Validate configuration and exit without opening listeners or writing files"
+    )]
+    check_config: bool,
 }
 
 #[tokio::main]
@@ -39,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let config_path = args.config.clone();
-    let mut config = ServerConfig::load(config_path.as_deref()).unwrap_or_default();
+    let mut config = ServerConfig::load(config_path.as_deref())?;
 
     if let Some(v) = args.bind {
         config.bind = v;
@@ -58,6 +65,20 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(v) = args.key_file {
         config.key_file = v;
+    }
+
+    config.validate()?;
+    if args.check_config {
+        println!("configuration is valid");
+        println!("  control: {}:{}", config.bind, config.control_port);
+        println!(
+            "  proxy range: {}:{}-{}",
+            config.effective_proxy_bind(),
+            config.port_min,
+            config.port_max
+        );
+        println!("  SSH port 22: protected");
+        return Ok(());
     }
 
     let server = Server::new(config).await?;

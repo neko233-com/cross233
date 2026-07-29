@@ -25,6 +25,7 @@ pub struct Server {
 
 impl Server {
     pub async fn new(mut config: ServerConfig) -> anyhow::Result<Self> {
+        config.validate()?;
         let auth_key =
             crate::crypto::load_or_create_auth_key(&config.auth_key_file, &config.auth_key)?;
         config.auth_key = auth_key.clone();
@@ -49,10 +50,17 @@ impl Server {
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
-        let state = SharedServiceState::new(
+        preflight_listener_ports(&self.config)?;
+
+        let proxy_bind = self.config.effective_proxy_bind().to_string();
+        let state = SharedServiceState::new_with_network_policy(
             self.config.port_min,
             self.config.port_max,
             self.config.qcp_port,
+            proxy_bind.clone(),
+            self.config.allow_privileged_ports,
+            self.config.effective_protected_ports(),
+            self.config.reserved_ports(),
         );
 
         let metrics = MetricsCollector::new();
@@ -65,7 +73,7 @@ impl Server {
 
         let auth = AuthState::new(self.auth_key.clone());
 
-        let udp_mgr = UdpManager::new(state.clone(), self.config.bind.clone());
+        let udp_mgr = UdpManager::new(state.clone(), proxy_bind);
 
         let control_addr = format!("{}:{}", self.config.bind, self.config.control_port);
         let control_listener = TcpListener::bind(&control_addr)
@@ -213,5 +221,58 @@ impl Server {
         }
 
         Ok(())
+    }
+}
+
+fn preflight_listener_ports(config: &ServerConfig) -> anyhow::Result<()> {
+    let tcp_ports = [
+        ("control", config.control_port),
+        ("web", config.web_port),
+        ("HTTP vhost", config.http_vhost_port),
+        ("HTTPS vhost", config.https_vhost_port),
+        ("TCPMUX", config.tcpmux_port),
+    ];
+    for (name, port) in tcp_ports.into_iter().filter(|(_, port)| *port != 0) {
+        let addr = format!("{}:{}", config.bind, port);
+        std::net::TcpListener::bind(&addr)
+            .with_context(|| format!("{name} listener cannot bind {addr}"))?;
+    }
+
+    let udp_ports = [
+        ("QCP", config.qcp_port),
+        ("QCP tunnel", config.qcp_tunnel_port),
+    ];
+    for (name, port) in udp_ports.into_iter().filter(|(_, port)| *port != 0) {
+        let addr = format!("{}:{}", config.bind, port);
+        std::net::UdpSocket::bind(&addr)
+            .with_context(|| format!("{name} listener cannot bind {addr}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preflight_listener_ports;
+    use crate::config::ServerConfig;
+
+    #[test]
+    fn preflight_rejects_an_occupied_server_port() {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let config = ServerConfig {
+            bind: "127.0.0.1".to_string(),
+            control_port: port,
+            web_port: 0,
+            http_vhost_port: 0,
+            https_vhost_port: 0,
+            tcpmux_port: 0,
+            qcp_port: 0,
+            qcp_tunnel_port: 0,
+            port_min: 60080,
+            port_max: 60090,
+            ..ServerConfig::default()
+        };
+
+        assert!(preflight_listener_ports(&config).is_err());
     }
 }

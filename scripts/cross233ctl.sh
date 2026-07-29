@@ -2,7 +2,7 @@
 # cross233ctl - cross233 control CLI for Linux/macOS
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 SERVER_URL="${CROSS233_SERVER:-${CROSS233_URL:-http://127.0.0.1:7711}}"
 SERVER_TOKEN="${CROSS233_TOKEN:-${CROSS233_API_TOKEN:-${CROSS233_AUTH_KEY:-}}}"
 SERVER_USER="${CROSS233_USER:-}"
@@ -15,7 +15,6 @@ JSON_OUTPUT=0
 LIMIT=120
 INTERVAL=2
 NAME=""
-TOGGLE_ENABLE=""
 
 usage() {
   cat <<'EOF'
@@ -77,14 +76,13 @@ fail() { printf 'cross233ctl: %s\n' "$*" >&2; exit 1; }
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-curl_base() {
-  local args=(-fsS)
-  if [ -n "$SERVER_CA_FILE" ]; then args+=(--cacert "$SERVER_CA_FILE"); fi
-  if [ "$SERVER_INSECURE" = "1" ]; then args+=(-k); fi
-  printf '%s ' "${args[@]}"
+build_curl_args() {
+  CURL_ARGS=(-fsS)
+  if [ -n "$SERVER_CA_FILE" ]; then CURL_ARGS+=(--cacert "$SERVER_CA_FILE"); fi
+  if [ "$SERVER_INSECURE" = "1" ]; then CURL_ARGS+=(-k); fi
 }
 
-COOKIE_JAR=""
+CURL_ARGS=()
 SESSION_FILE=""
 
 cleanup() {
@@ -99,16 +97,25 @@ ensure_auth() {
     fail "auth required: set CROSS233_TOKEN, or CROSS233_USER+CROSS233_PASSWORD"
   fi
   SESSION_FILE="$(mktemp)"
-  local body="{\"user\":\"$SERVER_USER\",\"password\":\"$SERVER_PASSWORD\"}"
-  local curl_args; curl_args="$(curl_base)"
-  eval curl $curl_args -c "$SESSION_FILE" -H 'Content-Type: application/json' \
-    -d "'$body'" "$SERVER_URL/api/login" >/dev/null || fail "login failed"
+  local body
+  if have_cmd jq; then
+    body=$(jq -cn --arg user "$SERVER_USER" --arg password "$SERVER_PASSWORD" \
+      '{user:$user,password:$password}')
+  elif have_cmd python3; then
+    body=$(python3 -c 'import json,sys; print(json.dumps({"user":sys.argv[1],"password":sys.argv[2]}))' \
+      "$SERVER_USER" "$SERVER_PASSWORD")
+  else
+    fail "jq or python3 is required for username/password login"
+  fi
+  build_curl_args
+  curl "${CURL_ARGS[@]}" -c "$SESSION_FILE" -H 'Content-Type: application/json' \
+    -d "$body" "$SERVER_URL/api/login" >/dev/null || fail "login failed"
 }
 
 api_call() {
   local method="$1" path="$2" body="${3:-}"
   ensure_auth
-  local curl_args; curl_args="$(curl_base)"
+  build_curl_args
   local auth_args=()
   if [ -n "$SERVER_TOKEN" ]; then
     auth_args+=(-H "Authorization: Bearer $SERVER_TOKEN")
@@ -117,18 +124,33 @@ api_call() {
   fi
   if [ "$method" = "POST" ]; then
     if [ -n "$body" ]; then
-      eval curl $curl_args "${auth_args[@]}" -X POST -H 'Content-Type: application/json' \
-        -d "'$body'" "$SERVER_URL$path"
+      curl "${CURL_ARGS[@]}" "${auth_args[@]}" -X POST -H 'Content-Type: application/json' \
+        -d "$body" "$SERVER_URL$path"
     else
-      eval curl $curl_args "${auth_args[@]}" -X POST "$SERVER_URL$path"
+      curl "${CURL_ARGS[@]}" "${auth_args[@]}" -X POST "$SERVER_URL$path"
     fi
   else
-    eval curl $curl_args "${auth_args[@]}" "$SERVER_URL$path"
+    curl "${CURL_ARGS[@]}" "${auth_args[@]}" "$SERVER_URL$path"
   fi
 }
 
 api_get() { api_call GET "$1"; }
-api_post() { api_call POST "$1" "$2"; }
+api_post() { api_call POST "$1" "${2:-}"; }
+
+urlencode() {
+  local LC_ALL=C input="$1" output="" char hex index
+  for ((index = 0; index < ${#input}; index++)); do
+    char="${input:index:1}"
+    case "$char" in
+      [a-zA-Z0-9.~_-]) output+="$char" ;;
+      *)
+        printf -v hex '%%%02X' "'$char"
+        output+="$hex"
+        ;;
+    esac
+  done
+  printf '%s' "$output"
+}
 
 format_bytes() {
   local b=$1
@@ -233,24 +255,24 @@ case "$COMMAND" in
 
   service)
     [ -n "$NAME" ] || fail "--name NAME required"
-    api_get "/api/services/$(python3 -c "import urllib.parse;print(urllib.parse.quote('$NAME'))" 2>/dev/null || echo "$NAME")"
+    api_get "/api/services/$(urlencode "$NAME")"
     ;;
 
   service-metrics)
     [ -n "$NAME" ] || fail "--name NAME required"
-    encoded=$(python3 -c "import urllib.parse;print(urllib.parse.quote('$NAME'))" 2>/dev/null || echo "$NAME")
+    encoded=$(urlencode "$NAME")
     api_get "/api/services/$encoded/metrics?limit=$LIMIT"
     ;;
 
   service-enable)
     [ -n "$NAME" ] || fail "--name NAME required"
-    encoded=$(python3 -c "import urllib.parse;print(urllib.parse.quote('$NAME'))" 2>/dev/null || echo "$NAME")
+    encoded=$(urlencode "$NAME")
     api_post "/api/services/$encoded/toggle" '{"enabled":true}'
     ;;
 
   service-disable)
     [ -n "$NAME" ] || fail "--name NAME required"
-    encoded=$(python3 -c "import urllib.parse;print(urllib.parse.quote('$NAME'))" 2>/dev/null || echo "$NAME")
+    encoded=$(urlencode "$NAME")
     api_post "/api/services/$encoded/toggle" '{"enabled":false}'
     ;;
 
@@ -258,7 +280,7 @@ case "$COMMAND" in
 
   client-kick)
     [ -n "$NAME" ] || fail "--name CLIENT_ID required"
-    encoded=$(python3 -c "import urllib.parse;print(urllib.parse.quote('$NAME'))" 2>/dev/null || echo "$NAME")
+    encoded=$(urlencode "$NAME")
     api_post "/api/clients/$encoded/kick"
     ;;
 
@@ -272,7 +294,11 @@ case "$COMMAND" in
 
   watch)
     ensure_auth
-    ws_url=$(echo "$SERVER_URL" | sed 's|^http|ws|')/api/ws
+    case "$SERVER_URL" in
+      https://*) ws_url="wss://${SERVER_URL#https://}/api/ws" ;;
+      http://*) ws_url="ws://${SERVER_URL#http://}/api/ws" ;;
+      *) fail "server URL must start with http:// or https://" ;;
+    esac
     echo "Streaming events from $ws_url (Ctrl+C to stop)..." >&2
     auth_header=""
     if [ -n "$SERVER_TOKEN" ]; then auth_header="Authorization: Bearer $SERVER_TOKEN"; fi
@@ -283,26 +309,32 @@ case "$COMMAND" in
       if [ -n "$auth_header" ]; then wscat -c "$ws_url" -H "$auth_header"
       else wscat -c "$ws_url"; fi
     elif have_cmd python3; then
-      python3 -c "
+      CROSS233_WS_URL="$ws_url" \
+      CROSS233_WS_TOKEN="$SERVER_TOKEN" \
+      CROSS233_WS_INSECURE="$SERVER_INSECURE" \
+      python3 - <<'PY'
 import asyncio, json, ssl, sys
+import os
 try:
     import websockets
 except ImportError:
     print('websocat or python3 websockets required for watch', file=sys.stderr); sys.exit(1)
 async def run():
     headers = {}
-    token = '$SERVER_TOKEN'
+    token = os.environ.get('CROSS233_WS_TOKEN', '')
     if token: headers['Authorization'] = f'Bearer {token}'
     ssl_ctx = ssl.create_default_context()
-    if '$SERVER_INSECURE' == '1': ssl_ctx.check_hostname = False; ssl_ctx.verify_mode = ssl.CERT_NONE
-    url = '$ws_url'
+    if os.environ.get('CROSS233_WS_INSECURE') == '1':
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+    url = os.environ['CROSS233_WS_URL']
     kw = {'extra_headers': headers}
     if url.startswith('wss'): kw['ssl'] = ssl_ctx
     async with websockets.connect(url, **kw) as ws:
         async for msg in ws:
             print(msg, flush=True)
 asyncio.run(run())
-"
+PY
     else
       fail "websocat, wscat, or python3 with websockets is required for watch"
     fi

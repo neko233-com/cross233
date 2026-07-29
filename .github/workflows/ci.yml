@@ -9,6 +9,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   check:
     name: check (${{ matrix.os }})
@@ -67,6 +70,10 @@ jobs:
             target: aarch64-unknown-linux-musl
             archive: tar.gz
             cross: true
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-musleabihf
+            archive: tar.gz
+            cross: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
@@ -80,6 +87,8 @@ jobs:
             archive: tar.gz
             cross: false
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -104,7 +113,7 @@ jobs:
 
       - name: Install cross (Linux musl)
         if: matrix.cross
-        run: cargo install cross --locked --git https://github.com/cross-rs/cross
+        run: cargo install cross --locked
 
       - name: Build
         run: |
@@ -118,18 +127,40 @@ jobs:
       - name: Package (unix)
         if: matrix.archive == 'tar.gz'
         run: |
-          cd target/${{ matrix.target }}/release
-          chmod +x cross233-server cross233-client
-          tar -czf ../../../cross233-${{ github.ref_name }}-${{ matrix.target }}.tar.gz cross233-server cross233-client
+          package_dir="${RUNNER_TEMP}/cross233-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "${package_dir}/scripts" "${package_dir}/examples"
+          cp "target/${{ matrix.target }}/release/cross233-server" "${package_dir}/"
+          cp "target/${{ matrix.target }}/release/cross233-client" "${package_dir}/"
+          chmod +x "${package_dir}/cross233-server" "${package_dir}/cross233-client"
+          cp README.md CHANGELOG.md LICENSE install.sh install.ps1 "${package_dir}/"
+          cp scripts/install-server.sh scripts/cross233ctl.sh scripts/cross233ctl.ps1 "${package_dir}/scripts/"
+          cp examples/server.toml examples/client.toml "${package_dir}/examples/"
+          cp -R examples/docker-static "${package_dir}/examples/"
+          archive="cross233-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
+          tar -C "${package_dir}" -czf "${archive}" .
+          sha256sum "${archive}" > "${archive}.sha256"
         shell: bash
 
       - name: Package (windows)
         if: matrix.archive == 'zip'
         run: |
-          Compress-Archive -Path target/${{ matrix.target }}/release/cross233-server.exe, target/${{ matrix.target }}/release/cross233-client.exe -DestinationPath cross233-${{ github.ref_name }}-${{ matrix.target }}.zip
+          $packageDir = Join-Path $env:RUNNER_TEMP "cross233-${{ github.ref_name }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $packageDir, (Join-Path $packageDir "scripts"), (Join-Path $packageDir "examples") | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/cross233-server.exe", "target/${{ matrix.target }}/release/cross233-client.exe" -Destination $packageDir
+          Copy-Item "README.md", "CHANGELOG.md", "LICENSE", "install.sh", "install.ps1" -Destination $packageDir
+          Copy-Item "scripts/install-server.sh", "scripts/cross233ctl.sh", "scripts/cross233ctl.ps1" -Destination (Join-Path $packageDir "scripts")
+          Copy-Item "examples/server.toml", "examples/client.toml" -Destination (Join-Path $packageDir "examples")
+          Copy-Item "examples/docker-static" -Recurse -Destination (Join-Path $packageDir "examples")
+          $archive = "cross233-${{ github.ref_name }}-${{ matrix.target }}.zip"
+          Compress-Archive -Path (Join-Path $packageDir "*") -DestinationPath $archive
+          "$(Get-FileHash $archive -Algorithm SHA256 | Select-Object -ExpandProperty Hash)  $archive" | Set-Content -Encoding ascii "$archive.sha256"
         shell: pwsh
 
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
         with:
-          files: cross233-${{ github.ref_name }}-${{ matrix.target }}.*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          overwrite_files: true
+          files: |
+            cross233-${{ github.ref_name }}-${{ matrix.target }}.*

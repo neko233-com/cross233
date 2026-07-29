@@ -1,0 +1,14 @@
+server = "YOUR_SERVER_IP:7710"
+auth_key = "YOUR_AUTH_KEY"
+client_id = "cross233-docker-static"
+transport = "auto"
+qcp_tunnel_port = 7714
+web_addr = "127.0.0.1:7721"
+
+[[services]]
+name = "docker-static"
+type = "tcp"
+localAddr = "127.0.0.1:18080"
+remotePort = 60080
+healthCheck = "http"
+healthPath = "/healthz"

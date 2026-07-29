@@ -1,7 +1,6 @@
 use clap::Parser;
 use cross233_client::{Client, ClientConfig};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(name = "cross233-client", version, about = "Cross233 tunnel client")]
@@ -108,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let web_state = std::sync::Arc::new(tokio::sync::RwLock::new(state_data));
 
-    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
     let client = Client::new(cfg.clone(), web_state.clone(), shutdown.clone())?;
 
     let web_addr = cfg.web_addr.clone();
@@ -140,8 +139,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    ctrlc_handler(shutdown.clone());
-
     let client_task = tokio::spawn(async move {
         if let Err(e) = client.run().await {
             tracing::error!("client error: {e}");
@@ -155,24 +152,4 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("client stopped");
     Ok(())
-}
-
-fn ctrlc_handler(notify: Arc<tokio::sync::Notify>) {
-    #[cfg(windows)]
-    {
-        let n = notify.clone();
-        tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            n.notify_waiters();
-        });
-    }
-    #[cfg(not(windows))]
-    {
-        let n = notify.clone();
-        tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            n.notify_waiters();
-        });
-    }
-    let _ = notify;
 }

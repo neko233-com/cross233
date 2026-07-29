@@ -7,6 +7,11 @@ bind = "0.0.0.0"
 # Separate bind address for proxy ports (defaults to bind)
 # proxy_bind = "0.0.0.0"
 
+# Safety: clients cannot claim ports below 1024 unless explicitly enabled.
+# Port 22 is always protected; this list adds any other protected ports.
+allow_privileged_ports = false
+protected_ports = [22]
+
 # Authentication key (required - clients must use the same key)
 # Generate with: cross233-server genkey
 auth_key = "your-secret-auth-key-here"

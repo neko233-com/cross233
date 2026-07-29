@@ -19,8 +19,12 @@ Write-Host "Install dir: $InstallDir"
 Write-Host "Component:   $Component"
 Write-Host ""
 
-# Check architecture
-$Arch = if ([Environment]::Is64BitOperatingSystem) { "x86_64" } else { "i686" }
+# Check architecture. Releases currently target 64-bit Windows x86.
+$OsArchitecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+if ($OsArchitecture -ne [Runtime.InteropServices.Architecture]::X64) {
+    throw "Unsupported Windows architecture: $OsArchitecture (x86_64 is required)"
+}
+$Arch = "x86_64"
 $Os = "windows"
 $Triple = "${Arch}-pc-windows-msvc"
 
@@ -69,6 +73,20 @@ function Install-Prebuilt {
     $ok = Download-File -Url $DownloadUrl -OutFile $ArchivePath
     if (!$ok) {
         Write-Host "[!] Prebuilt binary not found, falling back to source build" -ForegroundColor Yellow
+        Remove-Item -Recurse -Force $TempDir -ErrorAction SilentlyContinue
+        return $false
+    }
+    $ChecksumPath = "$ArchivePath.sha256"
+    $ok = Download-File -Url "$DownloadUrl.sha256" -OutFile $ChecksumPath
+    if (!$ok) {
+        Write-Host "[!] Release checksum could not be downloaded" -ForegroundColor Red
+        Remove-Item -Recurse -Force $TempDir -ErrorAction SilentlyContinue
+        return $false
+    }
+    $ExpectedHash = ((Get-Content -LiteralPath $ChecksumPath -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
+    $ActualHash = (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($ExpectedHash) -or $ExpectedHash -ne $ActualHash) {
+        Write-Host "[!] Release checksum verification failed" -ForegroundColor Red
         Remove-Item -Recurse -Force $TempDir -ErrorAction SilentlyContinue
         return $false
     }
@@ -141,9 +159,30 @@ function Install-Binary {
             $samplePath = Join-Path $PSScriptRoot "examples\$ConfigName"
             if (Test-Path $samplePath) {
                 Copy-Item $samplePath $ConfigPath
+            } else {
+                $sampleUrl = "https://raw.githubusercontent.com/neko233-com/cross233/main/examples/$ConfigName"
+                $null = Download-File -Url $sampleUrl -OutFile $ConfigPath
             }
         }
     }
+}
+
+function Install-ClientTemplates {
+    $Destination = Join-Path $InstallDir "templates\docker-static"
+    $SiteDestination = Join-Path $Destination "site"
+    New-Item -ItemType Directory -Path $SiteDestination -Force | Out-Null
+
+    $SourceDir = Join-Path $PSScriptRoot "examples\docker-static"
+    if (Test-Path $SourceDir) {
+        Copy-Item -Path (Join-Path $SourceDir "*") -Destination $Destination -Recurse -Force
+    } else {
+        $BaseUrl = "https://raw.githubusercontent.com/neko233-com/cross233/main/examples/docker-static"
+        foreach ($File in @("Dockerfile", "nginx.conf", "client.toml.example", "README.md")) {
+            $null = Download-File -Url "$BaseUrl/$File" -OutFile (Join-Path $Destination $File)
+        }
+        $null = Download-File -Url "$BaseUrl/site/index.html" -OutFile (Join-Path $SiteDestination "index.html")
+    }
+    Write-Host "[+] Installed Docker service template to $Destination" -ForegroundColor Green
 }
 
 if ($Component -eq "both" -or $Component -eq "server") {
@@ -151,6 +190,7 @@ if ($Component -eq "both" -or $Component -eq "server") {
 }
 if ($Component -eq "both" -or $Component -eq "client") {
     Install-Binary -BinName "client"
+    Install-ClientTemplates
 }
 
 # Add to PATH
@@ -170,4 +210,5 @@ Write-Host "  Client: cross233-client.exe -c $InstallDir\client.toml"
 Write-Host ""
 Write-Host "Web admin panel (server): http://127.0.0.1:7711"
 Write-Host "Web admin panel (client): http://127.0.0.1:7721"
+Write-Host "Docker template: $InstallDir\templates\docker-static"
 Write-Host ""

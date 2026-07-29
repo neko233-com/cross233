@@ -1,11 +1,12 @@
 use cross233_protocol::{random_id, Message, Service};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::task::AbortHandle;
 use tokio::time::{timeout, Duration};
 
 /// Maximum time an inbound connection waits for the client to attach its
@@ -103,10 +104,14 @@ pub struct SharedServiceState {
     pub services_by_group: RwLock<HashMap<String, Vec<Arc<ServiceEntry>>>>,
     pub client_services: RwLock<HashMap<String, Vec<String>>>,
     pub allocated_ports: RwLock<HashMap<u16, String>>,
-    pub active_listeners: RwLock<HashMap<u16, ()>>,
+    active_listeners: RwLock<HashMap<u16, (String, AbortHandle)>>,
     next_port: AtomicUsize,
     port_min: u16,
     port_max: u16,
+    proxy_bind: String,
+    allow_privileged_ports: bool,
+    protected_ports: HashSet<u16>,
+    reserved_ports: HashSet<u16>,
     pub pending_work: RwLock<HashMap<String, PendingWorkSender>>,
     pending_static: RwLock<HashMap<String, PendingStaticResponse>>,
     static_slots: Arc<Semaphore>,
@@ -127,6 +132,27 @@ impl std::fmt::Debug for SharedServiceState {
 
 impl SharedServiceState {
     pub fn new(port_min: u16, port_max: u16, qcp_port: u16) -> Arc<Self> {
+        Self::new_with_network_policy(
+            port_min,
+            port_max,
+            qcp_port,
+            "0.0.0.0".to_string(),
+            false,
+            HashSet::from([22]),
+            HashSet::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_network_policy(
+        port_min: u16,
+        port_max: u16,
+        qcp_port: u16,
+        proxy_bind: String,
+        allow_privileged_ports: bool,
+        protected_ports: HashSet<u16>,
+        reserved_ports: HashSet<u16>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             services_by_name: RwLock::new(HashMap::new()),
             services_by_group: RwLock::new(HashMap::new()),
@@ -136,6 +162,10 @@ impl SharedServiceState {
             next_port: AtomicUsize::new(port_min as usize),
             port_min,
             port_max,
+            proxy_bind,
+            allow_privileged_ports,
+            protected_ports,
+            reserved_ports,
             pending_work: RwLock::new(HashMap::new()),
             pending_static: RwLock::new(HashMap::new()),
             static_slots: Arc::new(Semaphore::new(STATIC_CONTROL_MAX_IN_FLIGHT)),
@@ -143,6 +173,10 @@ impl SharedServiceState {
             client_control_tx: RwLock::new(HashMap::new()),
             qcp_port,
         })
+    }
+
+    pub fn proxy_bind(&self) -> &str {
+        &self.proxy_bind
     }
 
     pub async fn register_services(
@@ -165,13 +199,93 @@ impl SharedServiceState {
             }
             let name = svc.name.clone();
 
+            let existing = self.services_by_name.read().await.get(&name).cloned();
+            if existing
+                .as_ref()
+                .is_some_and(|entry| entry.client_id != client_id)
+            {
+                tracing::warn!(
+                    client_id,
+                    service = %name,
+                    "service registration rejected because the name is already in use"
+                );
+                continue;
+            }
+
             if svc.uses_auto_port() {
-                if let Some(port) = self.allocate_port(&name).await {
+                if let Some(port) = existing
+                    .as_ref()
+                    .filter(|entry| {
+                        uses_direct_public_port(&entry.config)
+                            && self
+                                .validate_explicit_port(entry.config.remote_port)
+                                .is_ok()
+                    })
+                    .map(|entry| entry.config.remote_port)
+                {
                     svc.remote_port = port;
+                    self.allocated_ports
+                        .write()
+                        .await
+                        .entry(port)
+                        .or_insert_with(|| name.clone());
+                } else if let Some(port) = self.allocate_port(&name).await {
+                    svc.remote_port = port;
+                } else {
+                    tracing::warn!(client_id, service = %name, "no safe proxy port is available");
+                    continue;
                 }
-            } else if svc.is_tcp() && !svc.is_vhost() {
+            } else if uses_direct_public_port(&svc) {
+                if let Err(reason) = self.validate_explicit_port(svc.remote_port) {
+                    tracing::warn!(
+                        client_id,
+                        service = %name,
+                        port = svc.remote_port,
+                        reason,
+                        "service registration rejected"
+                    );
+                    continue;
+                }
                 let mut ports = self.allocated_ports.write().await;
-                ports.entry(svc.remote_port).or_insert_with(|| name.clone());
+                if ports
+                    .get(&svc.remote_port)
+                    .is_some_and(|owner| owner != &name)
+                {
+                    tracing::warn!(
+                        client_id,
+                        service = %name,
+                        port = svc.remote_port,
+                        "service registration rejected because the port is already allocated"
+                    );
+                    continue;
+                }
+                ports.insert(svc.remote_port, name.clone());
+            }
+
+            if let Some(previous) = existing {
+                let previous_port = previous.config.remote_port;
+                if uses_direct_public_port(&previous.config) && previous_port != svc.remote_port {
+                    let mut ports = self.allocated_ports.write().await;
+                    if ports
+                        .get(&previous_port)
+                        .is_some_and(|owner| owner == &name)
+                    {
+                        ports.remove(&previous_port);
+                    }
+                    drop(ports);
+                    if matches!(previous.config.effective_type(), "" | "tcp" | "static") {
+                        self.stop_listener(previous_port, &name).await;
+                    }
+                }
+                if let Some(group) = &previous.config.group {
+                    let mut groups = self.services_by_group.write().await;
+                    if let Some(entries) = groups.get_mut(group) {
+                        entries.retain(|entry| entry.config.name != name);
+                        if entries.is_empty() {
+                            groups.remove(group);
+                        }
+                    }
+                }
             }
 
             let entry = Arc::new(ServiceEntry::new(
@@ -201,8 +315,16 @@ impl SharedServiceState {
         assigned
     }
 
-    pub async fn mark_listener_active(&self, port: u16) {
-        self.active_listeners.write().await.insert(port, ());
+    pub async fn register_listener(
+        &self,
+        port: u16,
+        service_name: String,
+        abort_handle: AbortHandle,
+    ) {
+        self.active_listeners
+            .write()
+            .await
+            .insert(port, (service_name, abort_handle));
     }
 
     pub async fn is_listener_active(&self, port: u16) -> bool {
@@ -214,12 +336,30 @@ impl SharedServiceState {
         for _ in 0..(self.port_max - self.port_min + 1) {
             let idx = self.next_port.fetch_add(1, Ordering::Relaxed);
             let port = self.port_min + (idx % (self.port_max - self.port_min + 1) as usize) as u16;
-            if let std::collections::hash_map::Entry::Vacant(entry) = ports.entry(port) {
-                entry.insert(name.to_string());
-                return Some(port);
+            if self.validate_explicit_port(port).is_ok() {
+                if let std::collections::hash_map::Entry::Vacant(entry) = ports.entry(port) {
+                    entry.insert(name.to_string());
+                    return Some(port);
+                }
             }
         }
         None
+    }
+
+    fn validate_explicit_port(&self, port: u16) -> Result<(), &'static str> {
+        if port == 0 {
+            return Err("port zero is only valid for automatic allocation");
+        }
+        if self.protected_ports.contains(&port) {
+            return Err("port is protected by server configuration");
+        }
+        if self.reserved_ports.contains(&port) {
+            return Err("port is reserved by a cross233 server listener");
+        }
+        if port < 1024 && !self.allow_privileged_ports {
+            return Err("privileged ports below 1024 are disabled");
+        }
+        Ok(())
     }
 
     pub async fn is_current_control(
@@ -269,6 +409,7 @@ impl SharedServiceState {
             client_services.remove(client_id).unwrap_or_default()
         };
 
+        let mut listener_ports = Vec::new();
         let mut by_name = self.services_by_name.write().await;
         let mut ports = self.allocated_ports.write().await;
         let mut by_group = self.services_by_group.write().await;
@@ -277,6 +418,9 @@ impl SharedServiceState {
             if let Some(entry) = by_name.remove(name) {
                 if entry.config.remote_port != 0 && !entry.config.is_vhost() {
                     ports.remove(&entry.config.remote_port);
+                    if matches!(entry.config.effective_type(), "" | "tcp" | "static") {
+                        listener_ports.push((entry.config.remote_port, entry.config.name.clone()));
+                    }
                 }
                 if let Some(group) = &entry.config.group {
                     if let Some(entries) = by_group.get_mut(group) {
@@ -287,6 +431,13 @@ impl SharedServiceState {
                     }
                 }
             }
+        }
+        drop(by_group);
+        drop(ports);
+        drop(by_name);
+
+        for (port, service_name) in listener_ports {
+            self.stop_listener(port, &service_name).await;
         }
     }
 
@@ -540,9 +691,44 @@ impl SharedServiceState {
         None
     }
 
-    pub async fn remove_listener_handle(&self, port: u16) {
-        self.active_listeners.write().await.remove(&port);
+    pub async fn remove_listener_handle(&self, port: u16, service_name: &str) {
+        let mut listeners = self.active_listeners.write().await;
+        if listeners
+            .get(&port)
+            .is_some_and(|(owner, _)| owner == service_name)
+        {
+            listeners.remove(&port);
+        }
     }
+
+    pub async fn stop_listener(&self, port: u16, service_name: &str) {
+        let abort_handle = {
+            let mut listeners = self.active_listeners.write().await;
+            match listeners.get(&port) {
+                Some((owner, _)) if owner == service_name => {
+                    listeners.remove(&port).map(|(_, handle)| handle)
+                }
+                _ => None,
+            }
+        };
+        if let Some(handle) = abort_handle {
+            handle.abort();
+            let _ = timeout(Duration::from_secs(1), async {
+                while !handle.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            tracing::info!(service = %service_name, port, "TCP listener stopped");
+        }
+    }
+}
+
+fn uses_direct_public_port(service: &Service) -> bool {
+    matches!(
+        service.effective_type(),
+        "" | "tcp" | "static" | "udp" | "qcp"
+    ) && service.remote_port != 0
 }
 
 #[cfg(test)]
@@ -568,6 +754,82 @@ mod tests {
             remote_port: 60080,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn ssh_and_server_listener_ports_are_rejected() {
+        let state = SharedServiceState::new_with_network_policy(
+            60080,
+            60090,
+            7713,
+            "127.0.0.1".to_string(),
+            true,
+            HashSet::from([22]),
+            HashSet::from([7710, 7713]),
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut ssh = test_service();
+        ssh.name = "must-not-shadow-ssh".to_string();
+        ssh.remote_port = 22;
+        let mut control = test_service();
+        control.name = "must-not-shadow-control".to_string();
+        control.remote_port = 7710;
+
+        let assigned = state
+            .register_services("client", tx, vec![ssh, control])
+            .await;
+
+        assert!(assigned.is_empty());
+        assert!(state.get_all_services().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn privileged_ports_require_explicit_opt_in() {
+        let state = SharedServiceState::new_with_network_policy(
+            60080,
+            60090,
+            0,
+            "127.0.0.1".to_string(),
+            false,
+            HashSet::from([22]),
+            HashSet::new(),
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut service = test_service();
+        service.remote_port = 808;
+
+        let assigned = state.register_services("client", tx, vec![service]).await;
+
+        assert!(assigned.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconnect_reuses_auto_port_without_leaking_allocations() {
+        let state = SharedServiceState::new(60080, 60081, 0);
+        let mut service = test_service();
+        service.remote_port = 0;
+        service.group = Some("reconnect-group".to_string());
+        let (first_tx, _first_rx) = mpsc::unbounded_channel();
+        let first = state
+            .register_services("client", first_tx, vec![service.clone()])
+            .await;
+        let (second_tx, _second_rx) = mpsc::unbounded_channel();
+        let second = state
+            .register_services("client", second_tx, vec![service])
+            .await;
+
+        assert_eq!(first[0].remote_port, second[0].remote_port);
+        assert_eq!(state.allocated_ports.read().await.len(), 1);
+        assert_eq!(
+            state
+                .services_by_group
+                .read()
+                .await
+                .get("reconnect-group")
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

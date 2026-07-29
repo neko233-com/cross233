@@ -41,7 +41,13 @@ detect_platform() {
         *) err "Unsupported architecture: $arch"; exit 1 ;;
     esac
     case "$os" in
-        linux) os="unknown-linux-musl" ;;
+        linux)
+            if [ "$arch" = "armv7" ]; then
+                os="unknown-linux-musleabihf"
+            else
+                os="unknown-linux-musl"
+            fi
+            ;;
         darwin) os="apple-darwin" ;;
         *) err "Unsupported OS: $os"; exit 1 ;;
     esac
@@ -72,25 +78,52 @@ download() {
     fi
 }
 
+verify_sha256() {
+    local file="$1"
+    local checksum_file="$2"
+    local expected actual
+    expected=$(awk '{print tolower($1); exit}' "$checksum_file")
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual=$(sha256sum "$file" | awk '{print tolower($1)}')
+    elif command -v shasum >/dev/null 2>&1; then
+        actual=$(shasum -a 256 "$file" | awk '{print tolower($1)}')
+    else
+        err "Neither sha256sum nor shasum is available"
+        return 1
+    fi
+    [ -n "$expected" ] && [ "$expected" = "$actual" ]
+}
+
 install_prebuilt() {
     local bin_name="$1"
     local tag
+    local tmpdir
+    tmpdir=$(mktemp -d)
 
     if [ "$VERSION" = "latest" ]; then
-        tag=$(curl -fsSL "https://api.github.com/repos/neko233-com/cross233/releases/latest" | grep '"tag_name"' | head -1 | sed -E 's/.*"tag_name":\s*"([^"]+)".*/\1/')
+        local release_json="$tmpdir/release.json"
+        if ! download "https://api.github.com/repos/neko233-com/cross233/releases/latest" "$release_json"; then
+            rm -rf "$tmpdir"
+            return 1
+        fi
+        tag=$(grep '"tag_name"' "$release_json" | head -1 | sed -E 's/.*"tag_name":\s*"([^"]+)".*/\1/')
     else
         tag="$VERSION"
     fi
 
     local archive_name="cross233-${tag}-${TRIPLE}.tar.gz"
     local download_url="${RELEASES_URL}/download/${tag}/${archive_name}"
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    trap 'rm -rf "$tmpdir"' EXIT
 
     info "Downloading $download_url ..."
     if ! download "$download_url" "$tmpdir/$archive_name"; then
         warn "Prebuilt binary not found, will build from source"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+    if ! download "$download_url.sha256" "$tmpdir/$archive_name.sha256" ||
+       ! verify_sha256 "$tmpdir/$archive_name" "$tmpdir/$archive_name.sha256"; then
+        warn "Release checksum verification failed"
+        rm -rf "$tmpdir"
         return 1
     fi
 
@@ -98,6 +131,7 @@ install_prebuilt() {
     local exe_name="cross233-${bin_name}"
     cp "$tmpdir/$exe_name" "$INSTALL_DIR/$exe_name"
     chmod +x "$INSTALL_DIR/$exe_name"
+    rm -rf "$tmpdir"
     ok "Installed $exe_name to $INSTALL_DIR/$exe_name"
     return 0
 }
@@ -112,7 +146,6 @@ build_from_source() {
 
     local tmpdir
     tmpdir=$(mktemp -d)
-    trap 'rm -rf "$tmpdir"' EXIT
 
     info "Cloning source ..."
     if [ -f "$(dirname "$0")/Cargo.toml" ]; then
@@ -123,11 +156,16 @@ build_from_source() {
 
     pushd "$tmpdir" >/dev/null
     info "Building cross233-${bin_name} ..."
-    cargo build --release -p "cross233-${bin_name}"
+    if ! cargo build --release -p "cross233-${bin_name}"; then
+        popd >/dev/null
+        rm -rf "$tmpdir"
+        return 1
+    fi
     local exe_name="cross233-${bin_name}"
     cp "target/release/$exe_name" "$INSTALL_DIR/$exe_name"
     chmod +x "$INSTALL_DIR/$exe_name"
     popd >/dev/null
+    rm -rf "$tmpdir"
     ok "Built and installed $exe_name to $INSTALL_DIR/$exe_name"
 }
 
@@ -150,19 +188,49 @@ install_binary() {
             config_name="client.toml"
         fi
         if [ ! -f "$INSTALL_DIR/$config_name" ]; then
-            local sample="$(dirname "$0")/examples/$config_name"
+            local sample
+            sample="$(dirname "$0")/examples/$config_name"
             if [ -f "$sample" ]; then
                 cp "$sample" "$INSTALL_DIR/$config_name"
+            else
+                download \
+                    "https://raw.githubusercontent.com/neko233-com/cross233/main/examples/$config_name" \
+                    "$INSTALL_DIR/$config_name" ||
+                    warn "Could not install the sample $config_name"
             fi
         fi
     fi
+}
+
+install_client_templates() {
+    local destination="$INSTALL_DIR/templates/docker-static"
+    local source_dir
+    source_dir="$(dirname "$0")/examples/docker-static"
+    mkdir -p "$destination/site"
+
+    if [ -d "$source_dir" ]; then
+        cp -R "$source_dir/." "$destination/"
+    else
+        local base="https://raw.githubusercontent.com/neko233-com/cross233/main/examples/docker-static"
+        local file
+        for file in Dockerfile nginx.conf client.toml.example README.md; do
+            download "$base/$file" "$destination/$file" ||
+                warn "Could not install Docker template file: $file"
+        done
+        download "$base/site/index.html" "$destination/site/index.html" ||
+            warn "Could not install Docker template HTML"
+    fi
+    ok "Installed Docker service template to $destination"
 }
 
 case "$COMPONENT" in
     both|server) install_binary "server" ;;
 esac
 case "$COMPONENT" in
-    both|client) install_binary "client" ;;
+    both|client)
+        install_binary "client"
+        install_client_templates
+        ;;
 esac
 
 # Add to PATH
@@ -191,6 +259,7 @@ echo "  Client: $INSTALL_DIR/cross233-client -c $INSTALL_DIR/client.toml"
 echo ""
 echo "Web admin panel (server): http://127.0.0.1:7711"
 echo "Web admin panel (client): http://127.0.0.1:7721"
+echo "Docker template: $INSTALL_DIR/templates/docker-static"
 echo ""
 echo "Restart your shell or run: source $RC_FILE"
 echo ""

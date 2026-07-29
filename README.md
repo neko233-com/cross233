@@ -156,6 +156,7 @@ Cross233 supports TOML (default), JSON, and YAML configuration formats. The form
 
 ```toml
 bind = "0.0.0.0"                    # Bind address for all ports
+proxy_bind = "0.0.0.0"              # Bind address for client proxy ports
 auth_key = "your-secret-key"        # Authentication key (required)
 # auth_key_file = "/path/to/key"    # Read key from file instead
 control_port = 7710                 # Control channel port
@@ -166,6 +167,8 @@ qcp_port = 7713                     # QCP UDP port
 qcp_tunnel_port = 7714              # TLS-over-QCP tunnel port (0 disables)
 port_min = 7712                     # Min auto-allocated port
 port_max = 7720                     # Max auto-allocated port
+allow_privileged_ports = false      # Reject client ports below 1024
+protected_ports = [22]              # Additional protected ports; SSH 22 is always protected
 subdomain_host = "example.com"      # Domain for subdomain routing
 max_connections = 256               # Max concurrent connections
 web_user = "admin"                  # Web dashboard username (optional)
@@ -223,6 +226,7 @@ modify SSH, firewall, sysctl, or other operating-system settings.
 | Type   | Description                          | Key Fields |
 |--------|--------------------------------------|------------|
 | `tcp`  | TCP port forwarding                  | `remotePort` |
+| `static` | Built-in static directory server  | `localAddr` directory, `remotePort` |
 | `udp`  | UDP port forwarding                  | `remotePort` |
 | `http` | HTTP virtual host                    | `subdomain`, `host`, `locations` |
 | `https`| HTTPS virtual host (TLS passthrough) | `subdomain`, `host` |
@@ -230,6 +234,33 @@ modify SSH, firewall, sysctl, or other operating-system settings.
 | `sudp` | Secret UDP                           | `secret` |
 | `tcpmux`| TCP HTTP connect multiplexer        | `subdomain` |
 | `qcp`  | Reliable UDP transport               | `remotePort` |
+
+Direct client services cannot claim the server's own listener ports. Ports
+below `1024` are also rejected by default. Port `22` is an unconditional
+server invariant: clearing `protected_ports` or enabling privileged ports still
+cannot let a tunnel shadow SSH.
+Set `proxy_bind` when proxy listeners should use an address different from the
+control and dashboard listeners.
+
+### Docker service template
+
+Client installations include `templates/docker-static`, a small nginx image
+that can be used to verify a full Docker-to-public-server tunnel:
+
+```bash
+cd ~/.cross233/templates/docker-static
+docker build -t cross233-static-demo .
+docker run --rm --name cross233-static-demo \
+  -p 127.0.0.1:18080:8080 cross233-static-demo
+cp client.toml.example client.toml
+# Fill in server and auth_key, then:
+cross233-client -c client.toml
+curl -fsS http://YOUR_SERVER_IP:60080/
+```
+
+Stop the client after validation; the server releases `60080` automatically.
+Replace `site/` to publish another static site, or point `localAddr` at any
+existing local container/service without using this Dockerfile.
 
 ### Service Options
 
@@ -435,9 +466,16 @@ sudo bash scripts/install-server.sh
 
 This will:
 1. Download the latest release binary
-2. Generate a random auth key
-3. Create systemd service with security hardening
-4. Enable and start the service
+2. Preserve the existing auth key during upgrades (or generate it on first install)
+3. Validate configuration before touching the running service
+4. Run as a dedicated unprivileged `cross233` user
+5. Apply systemd filesystem, device, capability, namespace and resource isolation
+6. Atomically upgrade and automatically roll back if startup fails
+7. Enable and start the service
+
+The installer never changes `sshd`, firewall rules, nftables/iptables, sysctl,
+routes or network interfaces. Cross233 only opens the listeners declared in its
+validated configuration.
 
 ```bash
 # Check status
@@ -448,7 +486,13 @@ journalctl -u cross233 -f
 
 # View auth key
 sudo cat /var/lib/cross233/auth.key
+
+# Validate without opening ports or writing keys/certificates
+cross233-server --check-config -c /etc/cross233/server.toml
 ```
+
+Release archives include both binaries, checksums, installers, example
+configuration, maintenance scripts and the Docker static-service template.
 
 ## Comparison with frp
 
