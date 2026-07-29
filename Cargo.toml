@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "cross233-qcp",
+    "cross233-protocol",
+    "cross233-server",
+    "cross233-client",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/neko233-com/cross233"
+description = "A fast reverse proxy to expose local services behind NATs to the internet"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", features = ["ring"] }
+tokio-util = { version = "0.7", features = ["io"] }
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+rcgen = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+serde_yaml = "0.9"
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+bytes = "1"
+socket2 = "0.5"
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "time", "fmt"] }
+axum = { version = "0.8", features = ["ws", "macros"] }
+axum-extra = { version = "0.10", features = ["typed-header", "cookie"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
+rust-embed = "8"
+flate2 = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+cookie = { version = "0.18", features = ["secure"] }
+url = "2"
+mime_guess = "2"
+hex = "0.4"
+ipnet = "2"
+glob = "0.3"
+cross233-qcp = { path = "cross233-qcp" }
+cross233-protocol = { path = "cross233-protocol" }

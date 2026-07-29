@@ -1,0 +1,25 @@
+[package]
+name = "cross233-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cross233 protocol message types and crypto utilities"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rcgen = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+ipnet = { workspace = true }
