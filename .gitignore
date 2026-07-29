@@ -1,4 +1,44 @@
+# Rust build artifacts
+/target/
 /dist/
-/cross233-cert.pem
-/cross233-key.pem
 *.exe
+
+# Web build artifacts
+/web/dist/
+/cross233-server/webroot/
+/web/node_modules/
+
+# Auto-generated TLS certificates
+cross233-cert.pem
+cross233-key.pem
+cross233-auth.key
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Tool-specific
+.workbuddy/
+.trae/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Local config overrides
+config.local.toml
+config.local.yaml
+config.local.json
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Local auto-transport probe/cache state (never contains credentials)
+/.cross233/

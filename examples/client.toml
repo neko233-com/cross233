@@ -1,0 +1,152 @@
+# Cross233 Client Configuration
+# TOML format (JSON and YAML also supported)
+
+# Server address (host:port)
+server = "127.0.0.1:7710"
+
+# TLS server name (for certificate verification)
+server_name = "cross233"
+
+# Authentication key (must match server's auth_key)
+auth_key = "your-secret-auth-key-here"
+
+# Path to auth key file (overrides auth_key if set)
+# auth_key_file = "cross233-auth.key"
+
+# Optional TLS client certificate and private key PEM
+# key_file = ""
+
+# Path to custom CA certificate file (for self-signed certs)
+# ca_file = ""
+
+# Skip TLS certificate verification (insecure, not recommended)
+# insecure = false
+
+# Client identifier (auto-generated if not set)
+# client_id = "my-client"
+
+# Maximum concurrent tunnel connections
+max_tunnels = 64
+
+# Public QCP service port on server side (legacy type = "qcp")
+qcp_port = 7713
+
+# Client-to-server data tunnel transport: tcp (default), qcp, or auto.
+# auto probes TLS-over-QCP first, then falls back to TCP before user data is sent.
+transport = "auto"
+
+# Dedicated TLS-over-QCP tunnel UDP port. This must match server qcp_tunnel_port.
+qcp_tunnel_port = 7714
+
+# Local diagnostic cache. It records only endpoint/transport results, never keys.
+# Relative paths resolve below the client config directory.
+# transport_cache_file = ".cross233/transport-cache.json"
+# transport_cache_ttl_secs = 86400
+# transport_probe_timeout_ms = 6000
+
+# Local web admin panel address
+web_addr = "127.0.0.1:7721"
+
+# Config reload interval in seconds (0 = disabled, checks file changes)
+# reload_interval = 0
+
+# Include additional config files (glob patterns supported)
+# includes = ["conf.d/*.toml"]
+
+# TCP service: forward local port to remote port
+[[services]]
+name = "ssh"
+type = "tcp"
+localAddr = "127.0.0.1:22"
+remotePort = 7712
+
+# HTTP virtual host service
+[[services]]
+name = "web"
+type = "http"
+localAddr = "127.0.0.1:8080"
+subdomain = "myapp"
+# customDomains = ["www.example.com"]
+
+# Built-in static site: localAddr is a directory, not a host:port.
+# It serves index.html plus files below that directory through remotePort.
+# [[services]]
+# name = "static-test"
+# type = "static"
+# localAddr = "C:/path/to/site"
+# remotePort = 60080
+
+# HTTPS virtual host service
+# [[services]]
+# name = "secure-web"
+# type = "https"
+# localAddr = "127.0.0.1:8443"
+# subdomain = "secure"
+
+# UDP service
+# [[services]]
+# name = "dns"
+# type = "udp"
+# localAddr = "127.0.0.1:53"
+# remotePort = 7714
+
+# STCP (secret TCP) - private service with access key
+# [[services]]
+# name = "secret-ssh"
+# type = "stcp"
+# localAddr = "127.0.0.1:22"
+# secret = "my-secret-key"
+
+# QCP (reliable UDP) service - low latency transport
+# [[services]]
+# name = "game"
+# type = "qcp"
+# localAddr = "127.0.0.1:25565"
+# remotePort = 7715
+
+# HTTP service with basic auth and header modification
+# [[services]]
+# name = "protected-web"
+# type = "http"
+# localAddr = "127.0.0.1:3000"
+# subdomain = "protected"
+# httpUser = "user"
+# httpPassword = "pass"
+# hostHeaderRewrite = "internal.local"
+# bandwidthLimitKbps = 1024
+#
+# [services.requestHeaders]
+# X-Forwarded-For = "true"
+#
+# [services.responseHeaders]
+# X-Custom = "value"
+
+# TCP service with PROXY protocol (preserves client IP)
+# [[services]]
+# name = "real-ip"
+# type = "tcp"
+# localAddr = "127.0.0.1:8080"
+# remotePort = 7716
+# proxyProtocol = true
+# proxyProtocolVersion = "v2"
+
+# Service with health check
+# [[services]]
+# name = "healthy-web"
+# type = "http"
+# localAddr = "127.0.0.1:8080"
+# subdomain = "healthy"
+# healthCheck = "http"
+# healthInterval = 10
+# healthTimeout = 3
+# healthMaxFailed = 3
+# healthPath = "/health"
+
+# STCP visitor - connect to a secret TCP service
+# [[visitors]]
+# name = "visit-secret-ssh"
+# type = "stcp"
+# server_name = "secret-ssh"
+# secret_key = "my-secret-key"
+# bind_addr = "127.0.0.1"
+# bind_port = 6000

@@ -1,0 +1,63 @@
+# Cross233 Server Configuration
+# TOML format (JSON and YAML also supported)
+
+# Address to bind all services to
+bind = "0.0.0.0"
+
+# Separate bind address for proxy ports (defaults to bind)
+# proxy_bind = "0.0.0.0"
+
+# Authentication key (required - clients must use the same key)
+# Generate with: cross233-server genkey
+auth_key = "your-secret-auth-key-here"
+
+# Path to auth key file (overrides auth_key if set)
+# auth_key_file = "cross233-auth.key"
+
+# TLS certificate and key files (auto-generated if not found)
+# cert_file = "cross233-cert.pem"
+# key_file = "cross233-key.pem"
+
+# Control port (for client connections)
+control_port = 7710
+
+# Web admin panel port
+web_port = 7711
+
+# HTTP virtual host port
+http_vhost_port = 80
+
+# HTTPS virtual host port
+https_vhost_port = 443
+
+# TCP multiplexer port (0 = disabled)
+# tcpmux_port = 0
+
+# QCP (Quick Connect Protocol) UDP port
+qcp_port = 7713
+
+# Dedicated TLS-over-QCP port for client tunnel data (0 = disabled).
+# This is separate from qcp_port so public QCP services and authenticated
+# client tunnels never share one UDP protocol endpoint.
+qcp_tunnel_port = 7714
+
+# Subdomain host for HTTP/HTTPS vhosts (e.g., example.com)
+# subdomain_host = "example.com"
+
+# Port range for automatic port allocation (TCP/UDP services)
+port_min = 7712
+port_max = 7720
+
+# Maximum concurrent connections
+max_connections = 256
+
+# Handshake timeout in seconds
+handshake_timeout = 10
+
+# Web admin panel basic auth (leave empty to disable auth)
+# web_user = "admin"
+# web_password = "admin"
+
+# API token for agent/CLI automation (Bearer token auth, recommended for scripts)
+# Generate with: openssl rand -hex 32
+# api_token = ""
